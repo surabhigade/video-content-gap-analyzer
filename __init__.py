@@ -11,6 +11,7 @@ embeddings and Pegasus descriptions. Two operators:
 import os
 import time
 import logging
+from typing import Optional
 from datetime import datetime
 from collections import defaultdict
 
@@ -20,6 +21,7 @@ import fiftyone.operators as foo
 import fiftyone.operators.types as types
 from fiftyone.operators.panel import Panel, PanelConfig
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 from sklearn.metrics.pairwise import cosine_distances, cosine_similarity
 from sklearn.preprocessing import normalize
 import umap
@@ -57,7 +59,7 @@ RATE_LIMIT_WAIT = 30
 
 # Gap detection
 SPARSE_THRESHOLD = 3
-GAP_SIMILARITY_THRESHOLD = 0.10
+GAP_SIMILARITY_THRESHOLD = 0.30
 ISOLATION_STD_FACTOR = 1.5
 COVERAGE_GRID_SIZE = 10
 
@@ -66,7 +68,7 @@ COVERAGE_GRID_SIZE = 10
 # Helper functions — API setup
 # ============================================================
 
-def get_twelvelabs_client():
+def get_twelvelabs_client() -> TwelveLabs:
     """Validate API key and return TwelveLabs client."""
     api_key = os.environ.get("TWELVELABS_API_KEY")
     if not api_key:
@@ -81,7 +83,7 @@ def get_twelvelabs_client():
 # Helper functions — Embedding (from notebook 01)
 # ============================================================
 
-def embed_sample(client, sample):
+def embed_sample(client: TwelveLabs, sample: fo.Sample) -> Optional[bool]:
     """Embed a single video sample via Marengo 3.0.
 
     Returns True on success, False on failure, None if skipped.
@@ -121,7 +123,9 @@ def embed_sample(client, sample):
         return False
 
 
-def embed_all_samples(client, dataset, ctx):
+def embed_all_samples(
+    client: TwelveLabs, dataset: fo.Dataset, ctx
+) -> tuple:
     """Embed all samples in dataset, reporting progress in the 0.0-0.25 range.
 
     Returns (success_count, fail_count, skip_count).
@@ -133,18 +137,22 @@ def embed_all_samples(client, dataset, ctx):
 
     for i, sample in enumerate(dataset):
         filename = os.path.basename(sample.filepath)
-        ctx.set_progress(
-            progress=0.25 * (i / max(total, 1)),
-            label=f"Embedding video {i + 1}/{total}: {filename}",
-        )
 
         result = embed_sample(client, sample)
         if result is None:
             skip_count += 1
+            status = "cached"
         elif result:
             success_count += 1
+            status = "done"
         else:
             fail_count += 1
+            status = "failed"
+
+        ctx.set_progress(
+            progress=0.25 * ((i + 1) / max(total, 1)),
+            label=f"Embedding video {i + 1}/{total} ({status}): {filename}",
+        )
 
     dataset.save()
     return success_count, fail_count, skip_count
@@ -154,7 +162,39 @@ def embed_all_samples(client, dataset, ctx):
 # Helper functions — Clustering (from notebook 02)
 # ============================================================
 
-def run_clustering(dataset, n_clusters):
+def find_optimal_k(embeddings_norm: np.ndarray, k_max: int = 10) -> int:
+    """Find the optimal number of clusters using silhouette score.
+
+    Tests k=2..min(k_max, n_samples-1) and returns the k with highest score.
+    Falls back to 2 if no valid k is found.
+    """
+    n_samples = len(embeddings_norm)
+    k_upper = min(k_max, n_samples - 1)
+
+    if k_upper < 2:
+        return 1
+
+    best_k = 2
+    best_score = -1.0
+
+    for k in range(2, k_upper + 1):
+        kmeans = KMeans(
+            n_clusters=k, random_state=KMEANS_RANDOM_STATE, n_init=KMEANS_N_INIT
+        )
+        labels = kmeans.fit_predict(embeddings_norm)
+        score = silhouette_score(embeddings_norm, labels, metric="cosine")
+        if score > best_score:
+            best_score = score
+            best_k = k
+
+    logger.info("Auto-selected k=%d (silhouette=%.3f)", best_k, best_score)
+    return best_k
+
+def run_clustering(
+    dataset: fo.Dataset,
+    n_clusters: int,
+    outlier_std_factor: float = OUTLIER_STD_FACTOR,
+) -> tuple:
     """Run KMeans clustering, outlier detection, and UMAP on embedded samples.
 
     Writes cluster_id, centroid_distance, is_outlier, umap_x, umap_y to each
@@ -181,6 +221,10 @@ def run_clustering(dataset, n_clusters):
 
     embeddings = np.array(embeddings_list)
     embeddings_norm = normalize(embeddings, norm="l2")
+
+    # Auto-select k if requested (n_clusters == 0)
+    if n_clusters == 0:
+        n_clusters = find_optimal_k(embeddings_norm)
 
     # Clamp n_clusters to valid range
     if n_clusters > n_samples:
@@ -216,7 +260,7 @@ def run_clustering(dataset, n_clusters):
 
     # Outlier detection
     if std_dist > 0:
-        threshold = mean_dist + OUTLIER_STD_FACTOR * std_dist
+        threshold = mean_dist + outlier_std_factor * std_dist
         is_outlier = distances > threshold
     else:
         is_outlier = np.zeros(n_samples, dtype=bool)
@@ -245,14 +289,14 @@ def run_clustering(dataset, n_clusters):
         sample.save()
 
     dataset.save()
-    return n_samples
+    return n_samples, n_clusters
 
 
 # ============================================================
 # Helper functions — Pegasus descriptions (from notebook 03)
 # ============================================================
 
-def find_cluster_representatives(dataset):
+def find_cluster_representatives(dataset: fo.Dataset) -> dict:
     """For each cluster_id, find the REPS_PER_CLUSTER samples closest to centroid."""
     clusters = defaultdict(list)
 
@@ -273,7 +317,7 @@ def find_cluster_representatives(dataset):
     return representatives
 
 
-def upload_asset(client, filepath):
+def upload_asset(client: TwelveLabs, filepath: str) -> Optional[object]:
     """Upload a video file as a Twelve Labs asset. Returns asset or None."""
     try:
         with open(filepath, "rb") as f:
@@ -284,7 +328,7 @@ def upload_asset(client, filepath):
         return None
 
 
-def analyze_via_asset(client, asset_id, prompt):
+def analyze_via_asset(client: TwelveLabs, asset_id: str, prompt: str) -> str:
     """Approach A: analyze directly using asset_id (no indexing)."""
     response = client.analyze(
         video=VideoContext_AssetId(asset_id=asset_id),
@@ -294,7 +338,7 @@ def analyze_via_asset(client, asset_id, prompt):
     return response.data
 
 
-def create_pegasus_index(client):
+def create_pegasus_index(client: TwelveLabs) -> str:
     """Create a Twelve Labs index with pegasus1.2 model support."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     index_name = f"{INDEX_NAME_PREFIX}-{timestamp}"
@@ -312,7 +356,9 @@ def create_pegasus_index(client):
     return index.id
 
 
-def index_and_analyze(client, index_id, asset_id, prompt):
+def index_and_analyze(
+    client: TwelveLabs, index_id: str, asset_id: str, prompt: str
+) -> str:
     """Approach B: index the asset, wait for ready, then analyze."""
     resp = client.indexes.indexed_assets.create(
         index_id=index_id,
@@ -337,7 +383,9 @@ def index_and_analyze(client, index_id, asset_id, prompt):
     return response.data
 
 
-def generate_description(client, filepath, use_indexing, index_id):
+def generate_description(
+    client: TwelveLabs, filepath: str, use_indexing: bool, index_id: Optional[str]
+) -> tuple:
     """Generate a Pegasus description for a video.
 
     Returns (description_or_None, use_indexing_updated).
@@ -383,7 +431,9 @@ def generate_description(client, filepath, use_indexing, index_id):
     return None, use_indexing
 
 
-def generate_cluster_labels(client, dataset, use_pegasus, ctx):
+def generate_cluster_labels(
+    client: TwelveLabs, dataset: fo.Dataset, use_pegasus: bool, ctx
+) -> dict:
     """Generate labels for each cluster and write cluster_label to all samples.
 
     Returns dict {cluster_id: label_str}.
@@ -403,7 +453,7 @@ def generate_cluster_labels(client, dataset, use_pegasus, ctx):
         for idx, cid in enumerate(sorted(representatives.keys())):
             ctx.set_progress(
                 progress=0.50 + 0.25 * (idx / max(n_clusters, 1)),
-                label=f"Describing cluster {cid + 1}/{n_clusters}...",
+                label=f"Generating description for cluster {idx + 1}/{n_clusters}...",
             )
 
             samples = representatives[cid]
@@ -455,7 +505,7 @@ def generate_cluster_labels(client, dataset, use_pegasus, ctx):
 # Helper functions — Gap detection (from notebook 04)
 # ============================================================
 
-def extract_cluster_data(dataset):
+def extract_cluster_data(dataset: fo.Dataset) -> tuple:
     """Extract embedded + clustered samples from the dataset.
 
     Returns (samples_list, embeddings, cluster_ids, umap_coords, cluster_labels_map).
@@ -503,7 +553,9 @@ def extract_cluster_data(dataset):
     return samples_list, embeddings, cluster_ids, umap_coords, cluster_labels_map
 
 
-def compute_centroids(embeddings_norm, cluster_ids):
+def compute_centroids(
+    embeddings_norm: np.ndarray, cluster_ids: np.ndarray
+) -> tuple:
     """Recompute L2-normalized cluster centroids from sample embeddings."""
     unique_ids = np.sort(np.unique(cluster_ids))
     centroids = []
@@ -518,7 +570,9 @@ def compute_centroids(embeddings_norm, cluster_ids):
     return centroids, unique_ids
 
 
-def detect_sparse_clusters(cluster_ids, cluster_labels_map, threshold=SPARSE_THRESHOLD):
+def detect_sparse_clusters(
+    cluster_ids: np.ndarray, cluster_labels_map: dict, threshold: int = SPARSE_THRESHOLD
+) -> list:
     """Flag clusters with fewer than threshold samples."""
     unique, counts = np.unique(cluster_ids, return_counts=True)
     sparse = []
@@ -534,7 +588,9 @@ def detect_sparse_clusters(cluster_ids, cluster_labels_map, threshold=SPARSE_THR
     return sparse
 
 
-def detect_isolated_clusters(centroids, unique_ids, cluster_labels_map):
+def detect_isolated_clusters(
+    centroids: np.ndarray, unique_ids: np.ndarray, cluster_labels_map: dict
+) -> list:
     """Identify clusters whose centroids are far from all others."""
     n_clusters = len(unique_ids)
     if n_clusters < 3:
@@ -562,7 +618,9 @@ def detect_isolated_clusters(centroids, unique_ids, cluster_labels_map):
     return isolated
 
 
-def compute_umap_coverage(umap_coords, grid_size=COVERAGE_GRID_SIZE):
+def compute_umap_coverage(
+    umap_coords: np.ndarray, grid_size: int = COVERAGE_GRID_SIZE
+) -> float:
     """Compute what fraction of the UMAP bounding box is occupied."""
     x_min, x_max = umap_coords[:, 0].min(), umap_coords[:, 0].max()
     y_min, y_max = umap_coords[:, 1].min(), umap_coords[:, 1].max()
@@ -590,7 +648,7 @@ def compute_umap_coverage(umap_coords, grid_size=COVERAGE_GRID_SIZE):
     return len(occupied) / (grid_size * grid_size)
 
 
-def embed_categories(client, categories):
+def embed_categories(client: TwelveLabs, categories: list) -> dict:
     """Embed category strings via Twelve Labs Marengo text API.
 
     Returns dict {category_str: np.ndarray(512,)} for successful embeddings.
@@ -626,10 +684,15 @@ def embed_categories(client, categories):
     return results
 
 
-def detect_category_gaps(category_embeddings, embeddings_norm, cluster_ids,
-                         unique_ids, cluster_labels_map,
-                         threshold=GAP_SIMILARITY_THRESHOLD,
-                         umap_coords=None):
+def detect_category_gaps(
+    category_embeddings: dict,
+    embeddings_norm: np.ndarray,
+    cluster_ids: np.ndarray,
+    unique_ids: np.ndarray,
+    cluster_labels_map: dict,
+    threshold: float = GAP_SIMILARITY_THRESHOLD,
+    umap_coords: Optional[np.ndarray] = None,
+) -> list:
     """Compare each category embedding to all sample embeddings."""
     categories = list(category_embeddings.keys())
     cat_matrix = np.array([category_embeddings[c] for c in categories])
@@ -660,7 +723,7 @@ def detect_category_gaps(category_embeddings, embeddings_norm, cluster_ids,
     return results
 
 
-def tag_sparse_samples(dataset, sparse_cluster_ids):
+def tag_sparse_samples(dataset: fo.Dataset, sparse_cluster_ids: set) -> int:
     """Tag samples in sparse clusters with 'sparse_cluster'."""
     tagged = 0
     for sample in dataset:
@@ -676,7 +739,13 @@ def tag_sparse_samples(dataset, sparse_cluster_ids):
     return tagged
 
 
-def detect_gaps(client, dataset, expected_categories, ctx):
+def detect_gaps(
+    client: TwelveLabs,
+    dataset: fo.Dataset,
+    expected_categories: list,
+    ctx,
+    gap_threshold: float = GAP_SIMILARITY_THRESHOLD,
+) -> dict:
     """Run full gap detection (structural + category-driven).
 
     Returns gap_report dict.
@@ -708,6 +777,7 @@ def detect_gaps(client, dataset, expected_categories, ctx):
             category_results = detect_category_gaps(
                 category_embeddings, embeddings_norm, cluster_ids,
                 unique_ids, cluster_labels_map,
+                threshold=gap_threshold,
                 umap_coords=umap_coords,
             )
             n_covered = sum(1 for cr in category_results if not cr["is_gap"])
@@ -747,6 +817,8 @@ def detect_gaps(client, dataset, expected_categories, ctx):
 # ============================================================
 
 class AnalyzeCoverage(foo.Operator):
+    """Full pipeline operator: embed videos, cluster, describe, detect gaps."""
+
     @property
     def config(self):
         return foo.OperatorConfig(
@@ -765,8 +837,11 @@ class AnalyzeCoverage(foo.Operator):
 
         inputs.int(
             "num_clusters",
-            label="Number of Clusters",
-            description="Number of clusters for grouping videos",
+            label="Number of Clusters (0 = auto)",
+            description=(
+                "Number of clusters for grouping videos. "
+                "Set to 0 to auto-select using silhouette score."
+            ),
             default=5,
         )
 
@@ -790,6 +865,36 @@ class AnalyzeCoverage(foo.Operator):
             default=True,
         )
 
+        inputs.int(
+            "max_samples",
+            label="Max Samples (0 = all)",
+            description=(
+                "Maximum number of samples to process. Set to 0 to process all "
+                "samples. Useful for large datasets to limit API costs and time."
+            ),
+            default=0,
+        )
+
+        inputs.float(
+            "outlier_threshold",
+            label="Outlier Threshold (std deviations)",
+            description=(
+                "Samples with centroid distance > mean + N*std are flagged as "
+                "outliers. Lower values flag more outliers."
+            ),
+            default=2.0,
+        )
+
+        inputs.float(
+            "gap_threshold",
+            label="Gap Similarity Threshold",
+            description=(
+                "Categories with max similarity below this value are flagged "
+                "as gaps. Higher values flag more gaps."
+            ),
+            default=0.3,
+        )
+
         return types.Property(
             inputs,
             view=types.View(label="Video Content Gap Analyzer"),
@@ -800,23 +905,71 @@ class AnalyzeCoverage(foo.Operator):
         num_clusters = ctx.params.get("num_clusters", 5)
         expected_categories_str = ctx.params.get("expected_categories", "")
         use_pegasus = ctx.params.get("use_pegasus", True)
+        max_samples = ctx.params.get("max_samples", 0)
+        outlier_threshold = ctx.params.get("outlier_threshold", 2.0)
+        gap_threshold = ctx.params.get("gap_threshold", 0.3)
 
         # Parse categories
         expected_categories = [
             c.strip() for c in expected_categories_str.split(",") if c.strip()
         ] if expected_categories_str else []
 
+        # Edge case: empty dataset
+        total = len(dataset)
+        if total == 0:
+            return {"error": "Dataset is empty. Add video samples before analyzing."}
+
+        # Subsample if max_samples is set
+        if max_samples > 0 and total > max_samples:
+            logger.info(
+                "Subsampling %d of %d samples (max_samples=%d)",
+                max_samples, total, max_samples,
+            )
+            dataset = dataset.take(max_samples)
+            total = len(dataset)
+
+        # Large dataset warning
+        if total > 100:
+            logger.warning(
+                "Large dataset (%d samples). This may take a while and "
+                "incur significant API costs. Consider setting max_samples.",
+                total,
+            )
+            ctx.set_progress(
+                progress=0.0,
+                label=f"WARNING: {total} samples — this may take a while. "
+                "Consider using max_samples to limit processing.",
+            )
+
+        # Edge case: very small dataset
+        if total < 3:
+            logger.warning(
+                "Dataset has only %d sample(s); forcing num_clusters=1", total
+            )
+            num_clusters = 1
+
         # Validate API key
-        client = get_twelvelabs_client()
+        try:
+            client = get_twelvelabs_client()
+        except RuntimeError as e:
+            return {"error": str(e)}
 
         # Stage 1: Embeddings (0.00 - 0.25)
         ctx.set_progress(progress=0.0, label="Stage 1/4: Generating video embeddings...")
         success, fail, skip = embed_all_samples(client, dataset, ctx)
         logger.info("Embeddings: %d new, %d failed, %d skipped", success, fail, skip)
 
+        if skip == total:
+            ctx.set_progress(
+                progress=0.25,
+                label=f"Using existing embeddings (all {skip} cached)",
+            )
+
         # Stage 2: Clustering (0.25 - 0.50)
         ctx.set_progress(progress=0.25, label="Stage 2/4: Clustering embeddings...")
-        n_samples = run_clustering(dataset, num_clusters)
+        n_samples, num_clusters = run_clustering(
+            dataset, num_clusters, outlier_std_factor=outlier_threshold
+        )
         ctx.set_progress(
             progress=0.50,
             label=f"Clustered {n_samples} samples into {num_clusters} groups",
@@ -828,7 +981,10 @@ class AnalyzeCoverage(foo.Operator):
 
         # Stage 4: Gap detection (0.75 - 1.00)
         ctx.set_progress(progress=0.75, label="Stage 4/4: Detecting coverage gaps...")
-        gap_report = detect_gaps(client, dataset, expected_categories, ctx)
+        gap_report = detect_gaps(
+            client, dataset, expected_categories, ctx,
+            gap_threshold=gap_threshold,
+        )
 
         # Store report
         dataset.info["gap_report"] = gap_report
@@ -846,6 +1002,7 @@ class AnalyzeCoverage(foo.Operator):
 
     def resolve_output(self, ctx):
         outputs = types.Object()
+        outputs.str("error", label="Error", default=None)
         outputs.float("coverage_score", label="Coverage Score (0-1)")
         outputs.int("n_sparse_clusters", label="Sparse Clusters Found")
         outputs.int("n_category_gaps", label="Category Gaps Found")
@@ -862,6 +1019,8 @@ class AnalyzeCoverage(foo.Operator):
 # ============================================================
 
 class ShowGapReport(foo.Operator):
+    """Display the gap detection report from the last analysis run."""
+
     @property
     def config(self):
         return foo.OperatorConfig(
