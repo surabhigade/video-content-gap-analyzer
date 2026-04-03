@@ -1,4 +1,5 @@
 fiftyone
+huggingface_hub
 twelvelabs
 scikit-learn
 umap-learn
