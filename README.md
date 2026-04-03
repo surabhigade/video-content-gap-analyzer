@@ -18,40 +18,81 @@ Most teams improve their video models by collecting *more* data. But more data d
 
 ## Quick Start
 
-### Install
+### Prerequisites
+
+- Python 3.9–3.12
+- A [Twelve Labs](https://twelvelabs.io/) API key (free tier provides 600 minutes of indexing)
+
+### 1. Install the plugin
 
 ```bash
-# Clone and register as a FiftyOne plugin
+# Clone the repository
 git clone https://github.com/rishimule/video-content-gap-analyzer.git
-fiftyone plugins create video-content-gap-analyzer --from-dir ./video-content-gap-analyzer
+cd video-content-gap-analyzer
 
-# Or install directly from GitHub
-fiftyone plugins download https://github.com/rishimule/video-content-gap-analyzer
+# Install Python dependencies
+pip install -r requirements.txt
 
-# Install dependencies
-pip install -r video-content-gap-analyzer/requirements.txt
+# Register as a FiftyOne plugin
+fiftyone plugins create video-content-gap-analyzer --from-dir .
 ```
 
-### Set your API key
+Or install directly from GitHub:
+
+```bash
+fiftyone plugins download https://github.com/rishimule/video-content-gap-analyzer
+pip install twelvelabs scikit-learn umap-learn numpy huggingface_hub
+```
+
+### 2. Set your API key
 
 ```bash
 export TWELVELABS_API_KEY="your_key_here"
 ```
 
-### Run
+### 3. Run the demo
+
+The fastest way to see the plugin in action:
+
+```bash
+python demo.py
+```
+
+This loads 50 videos from the [Voxel51/Safe_and_Unsafe_Behaviours](https://huggingface.co/datasets/Voxel51/Safe_and_Unsafe_Behaviours) dataset, launches the FiftyOne App, and prints a step-by-step walkthrough in your terminal.
+
+### 4. Use with your own dataset
 
 ```python
 import fiftyone as fo
-import fiftyone.zoo as foz
+from fiftyone.utils.huggingface import load_from_hub
 
-# Load any video dataset
-dataset = foz.load_zoo_dataset("quickstart-video", max_samples=20)
+# Load a dataset from HuggingFace Hub...
+dataset = load_from_hub("Voxel51/Safe_and_Unsafe_Behaviours", max_samples=40)
 
-# Launch the App and run "Analyze Coverage" from the operator menu
+# ...or load your own video dataset
+# dataset = fo.Dataset.from_dir("/path/to/videos", fo.types.VideoDirectory)
+
 session = fo.launch_app(dataset)
 ```
 
-Open the operator browser (press `` ` `` in the App), search for **Analyze Coverage**, configure your parameters, and run. Results appear as sample fields and in the **Coverage Panel**.
+### 5. Run the analysis
+
+1. Press `` ` `` in the FiftyOne App to open the operator menu
+2. Search for **Analyze Coverage** and select it
+3. Configure parameters:
+   - **num_clusters**: `0` for auto-selection, or set a specific number
+   - **expected_categories**: comma-separated list (e.g., `person falling, forklift moving, fire evacuation`)
+   - **use_pegasus**: `True` for natural language labels, `False` for faster runs
+   - **max_samples**: `0` to process all, or set a limit
+4. Click **Execute** and watch the 4-stage progress bar
+
+### 6. View results
+
+**Coverage Panel** — Click the `+` tab in the App panel bar and select **Coverage Map** to see the interactive UMAP scatter plot with clusters and gap markers.
+
+**Gap Report** — Press `` ` `` again, search for **Show Gap Report**, and run it to see the coverage score, sparse clusters, and missing categories.
+
+**Explore the data** — Filter by the `sparse_cluster` tag, sort by `centroid_distance` to find outliers, or group by `cluster_label` to browse by topic.
 
 ## How It Works
 
