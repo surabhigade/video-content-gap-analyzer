@@ -5,3 +5,6 @@ description: Identify what's missing in your video dataset using Twelve Labs emb
 operators:
   - analyze_coverage
   - show_gap_report
+  - coverage_panel
+panels:
+  - coverage_panel

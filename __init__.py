@@ -18,6 +18,7 @@ import numpy as np
 import fiftyone as fo
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
+from fiftyone.operators.panel import Panel, PanelConfig
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_distances, cosine_similarity
 from sklearn.preprocessing import normalize
@@ -627,7 +628,8 @@ def embed_categories(client, categories):
 
 def detect_category_gaps(category_embeddings, embeddings_norm, cluster_ids,
                          unique_ids, cluster_labels_map,
-                         threshold=GAP_SIMILARITY_THRESHOLD):
+                         threshold=GAP_SIMILARITY_THRESHOLD,
+                         umap_coords=None):
     """Compare each category embedding to all sample embeddings."""
     categories = list(category_embeddings.keys())
     cat_matrix = np.array([category_embeddings[c] for c in categories])
@@ -641,13 +643,19 @@ def detect_category_gaps(category_embeddings, embeddings_norm, cluster_ids,
         closest_cid = int(cluster_ids[closest_sample_idx])
         closest_label = cluster_labels_map.get(closest_cid, f"Cluster {closest_cid}")
 
-        results.append({
+        result = {
             "category": category,
             "closest_cluster": closest_label,
             "closest_cluster_id": closest_cid,
             "similarity": round(max_sim, 4),
             "is_gap": max_sim < threshold,
-        })
+        }
+
+        if umap_coords is not None:
+            result["umap_x"] = float(umap_coords[closest_sample_idx, 0])
+            result["umap_y"] = float(umap_coords[closest_sample_idx, 1])
+
+        results.append(result)
 
     return results
 
@@ -700,6 +708,7 @@ def detect_gaps(client, dataset, expected_categories, ctx):
             category_results = detect_category_gaps(
                 category_embeddings, embeddings_norm, cluster_ids,
                 unique_ids, cluster_labels_map,
+                umap_coords=umap_coords,
             )
             n_covered = sum(1 for cr in category_results if not cr["is_gap"])
             category_coverage = n_covered / len(category_results)
@@ -722,6 +731,8 @@ def detect_gaps(client, dataset, expected_categories, ctx):
                 "category": cr["category"],
                 "closest_cluster": cr["closest_cluster"],
                 "similarity": cr["similarity"],
+                "umap_x": cr.get("umap_x", 0.0),
+                "umap_y": cr.get("umap_y", 0.0),
             }
             for cr in category_results if cr["is_gap"]
         ],
@@ -971,9 +982,222 @@ class ShowGapReport(foo.Operator):
 
 
 # ============================================================
+# Panel: CoveragePanel
+# ============================================================
+
+class CoveragePanel(Panel):
+    """Interactive visualization of video content gap analysis results."""
+
+    @property
+    def config(self):
+        return PanelConfig(
+            name="coverage_panel",
+            label="Coverage Map",
+            surfaces="grid",
+            allow_multiple=False,
+        )
+
+    def on_load(self, ctx):
+        self._build_panel_data(ctx)
+
+    def on_change_dataset(self, ctx):
+        self._build_panel_data(ctx)
+
+    def _build_panel_data(self, ctx):
+        """Extract sample data and build plot traces + summary markdown."""
+        dataset = ctx.dataset
+        if dataset is None:
+            ctx.panel.state.has_data = False
+            return
+
+        gap_report = dataset.info.get("gap_report")
+        if not gap_report:
+            ctx.panel.state.has_data = False
+            return
+
+        ctx.panel.state.has_data = True
+        score = gap_report.get("coverage_score", 0.0)
+
+        # Collect per-sample data grouped by cluster
+        clusters = {}
+        max_dist = 0.001
+
+        for sample in dataset:
+            try:
+                ux = sample["umap_x"]
+                uy = sample["umap_y"]
+                cid = sample["cluster_id"]
+                clabel = sample.get_field("cluster_label") or f"Cluster {cid}"
+                cdist = sample["centroid_distance"]
+            except (KeyError, AttributeError):
+                continue
+            if ux is None or uy is None or cid is None:
+                continue
+
+            if cid not in clusters:
+                clusters[cid] = {
+                    "label": clabel, "x": [], "y": [],
+                    "ids": [], "text": [], "dists": [],
+                }
+            fname = os.path.basename(sample.filepath)
+            clusters[cid]["x"].append(ux)
+            clusters[cid]["y"].append(uy)
+            clusters[cid]["ids"].append(sample.id)
+            clusters[cid]["text"].append(
+                f"{fname}<br>Cluster: {clabel[:40]}<br>Distance: {cdist:.3f}"
+            )
+            clusters[cid]["dists"].append(cdist)
+            if cdist > max_dist:
+                max_dist = cdist
+
+        if not clusters:
+            ctx.panel.state.has_data = False
+            return
+
+        # Build one Plotly trace per cluster
+        traces = []
+        for cid in sorted(clusters.keys()):
+            c = clusters[cid]
+            sizes = [6 + 8 * (d / max_dist) for d in c["dists"]]
+            label_short = (
+                c["label"][:30] + "..." if len(c["label"]) > 30 else c["label"]
+            )
+            traces.append({
+                "type": "scatter",
+                "mode": "markers",
+                "name": f"C{cid}: {label_short}",
+                "x": c["x"],
+                "y": c["y"],
+                "ids": c["ids"],
+                "marker": {"size": sizes, "opacity": 0.75},
+                "text": c["text"],
+                "hovertemplate": "%{text}<extra></extra>",
+            })
+
+        # Category gap markers (hollow red diamonds)
+        category_gaps = gap_report.get("category_gaps", [])
+        gaps_with_coords = [
+            g for g in category_gaps
+            if g.get("umap_x") is not None and g.get("umap_y") is not None
+        ]
+        if gaps_with_coords:
+            traces.append({
+                "type": "scatter",
+                "mode": "markers",
+                "name": "Missing Categories",
+                "x": [g["umap_x"] for g in gaps_with_coords],
+                "y": [g["umap_y"] for g in gaps_with_coords],
+                "marker": {
+                    "size": 16,
+                    "color": "rgba(0,0,0,0)",
+                    "line": {"color": "red", "width": 2.5},
+                    "symbol": "diamond-open",
+                },
+                "text": [
+                    f"MISSING: {g['category']}<br>"
+                    f"Similarity: {g['similarity']:.2f}<br>"
+                    f"Nearest: {g['closest_cluster'][:30]}"
+                    for g in gaps_with_coords
+                ],
+                "hovertemplate": "%{text}<extra></extra>",
+            })
+
+        layout = {
+            "xaxis": {"title": "UMAP-1", "showgrid": False, "zeroline": False},
+            "yaxis": {"title": "UMAP-2", "showgrid": False, "zeroline": False},
+            "legend": {"orientation": "h", "y": -0.15},
+            "hovermode": "closest",
+            "margin": {"l": 40, "r": 20, "t": 10, "b": 60},
+            "plot_bgcolor": "rgba(0,0,0,0)",
+            "paper_bgcolor": "rgba(0,0,0,0)",
+        }
+
+        ctx.panel.set_data("scatter_plot", {"data": traces, "layout": layout})
+
+        # Score markdown
+        ctx.panel.state.score_md = (
+            f"# Dataset Coverage: {score:.0%}\n\n"
+            f"**{len(clusters)} clusters** across "
+            f"**{sum(len(c['x']) for c in clusters.values())} samples**"
+        )
+
+        # Summary table
+        sparse_ids = {
+            s["cluster_id"] for s in gap_report.get("sparse_clusters", [])
+        }
+        lines = [
+            "### Cluster Summary", "",
+            "| Cluster | Label | Count | Status |",
+            "|---------|-------|-------|--------|",
+        ]
+        for cid in sorted(clusters.keys()):
+            c = clusters[cid]
+            count = len(c["x"])
+            label = c["label"][:50]
+            status = "**Sparse**" if cid in sparse_ids else "OK"
+            lines.append(f"| {cid} | {label} | {count} | {status} |")
+
+        if category_gaps:
+            lines += [
+                "", "### Missing Categories", "",
+                "| Category | Nearest Cluster | Similarity |",
+                "|----------|-----------------|------------|",
+            ]
+            for g in category_gaps:
+                lines.append(
+                    f"| {g['category']} "
+                    f"| {g['closest_cluster'][:40]} "
+                    f"| {g['similarity']:.2f} |"
+                )
+
+        ctx.panel.state.summary_md = "\n".join(lines)
+
+    def on_click_scatter(self, ctx):
+        """Select the clicked sample in the App grid."""
+        sample_id = ctx.params.get("id")
+        if sample_id:
+            ctx.ops.set_selected_samples([sample_id])
+
+    def render(self, ctx):
+        panel = types.Object()
+        has_data = ctx.panel.get_state("has_data", False)
+
+        if not has_data:
+            panel.md(
+                "### No coverage data available\n\n"
+                "Run the **Analyze Coverage** operator first to generate "
+                "embeddings, clusters, and gap detection results.\n\n"
+                "Then reopen this panel to see the visualization.",
+                name="no_data_msg",
+            )
+            return types.Property(panel, view=types.View(label="Coverage Map"))
+
+        # Coverage score header
+        panel.md(
+            ctx.panel.get_state("score_md", ""),
+            name="score_display",
+        )
+
+        # Scatter plot
+        panel.plot(
+            "scatter_plot",
+            on_click=self.on_click_scatter,
+        )
+
+        # Summary table
+        panel.md(
+            ctx.panel.get_state("summary_md", ""),
+            name="summary_table",
+        )
+
+        return types.Property(panel, view=types.View(label="Coverage Map"))
+
+
+# ============================================================
 # Plugin registration
 # ============================================================
 
 def register(p):
     p.register(AnalyzeCoverage)
     p.register(ShowGapReport)
+    p.register(CoveragePanel)
