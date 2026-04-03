@@ -1,0 +1,5 @@
+fiftyone
+twelvelabs
+scikit-learn
+umap-learn
+numpy

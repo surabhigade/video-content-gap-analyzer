@@ -1,0 +1,7 @@
+name: video-content-gap-analyzer
+version: 1.0.0
+label: Video Content Gap Analyzer
+description: Identify what's missing in your video dataset using Twelve Labs embeddings and clustering
+operators:
+  - analyze_coverage
+  - show_gap_report
