@@ -19,6 +19,16 @@
   <nav class="nav" role="navigation">
     <div class="nav-inner">
       <a href="#" class="nav-brand">Video Content Gap Analyzer</a>
+      <div class="nav-links">
+        <a href="#problem" class="nav-link">Problem</a>
+        <a href="#solution" class="nav-link">Pipeline</a>
+        <a href="#how" class="nav-link">How it Works</a>
+        <a href="#output" class="nav-link">Output</a>
+        <a href="#quickstart" class="nav-link">Quick Start</a>
+      </div>
+      <button class="nav-hamburger" aria-label="Toggle menu" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
       <div class="nav-actions">
         <a href="https://github.com/rishimule/video-content-gap-analyzer" target="_blank" rel="noopener" class="nav-icon-link" aria-label="View on GitHub">
           <svg viewBox="0 0 24 24"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
@@ -47,11 +57,26 @@
 
   <!-- ========== HERO ========== -->
   <section class="hero">
+    <div class="hero-orbs" aria-hidden="true">
+      <div class="orb orb-1"></div>
+      <div class="orb orb-2"></div>
+      <div class="orb orb-3"></div>
+    </div>
     <div class="hero-content">
       <p class="label">Video Understanding AI Hackathon &middot; Northeastern &middot; April 2026</p>
       <h1 class="heading-xl text-gradient">What's Missing<br>From Your Dataset?</h1>
       <p class="hero-sub">The best model in the world can't learn from data that isn't there. We built a tool that finds the gaps.</p>
       <p class="hero-team">Built by GAP SEEKERS</p>
+      <div class="hero-cta">
+        <a href="#quickstart" class="btn btn-primary">
+          <span>Get Started</span>
+          <svg viewBox="0 0 24 24" width="18" height="18"><polyline points="9 18 15 12 9 6"/></svg>
+        </a>
+        <a href="https://github.com/rishimule/video-content-gap-analyzer" target="_blank" rel="noopener" class="btn btn-secondary">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+          <span>View on GitHub</span>
+        </a>
+      </div>
     </div>
     <div class="scroll-indicator" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -61,7 +86,7 @@
   </section>
 
   <!-- ========== THE PROBLEM ========== -->
-  <section class="problem-section">
+  <section id="problem" class="problem-section">
     <div class="container">
       <h2 class="heading-lg reveal">Data curation beats<br>model complexity.</h2>
 
@@ -79,7 +104,7 @@
   </section>
 
   <!-- ========== THE SOLUTION ========== -->
-  <section class="solution-section">
+  <section id="solution" class="solution-section">
     <div class="container">
       <h2 class="heading-lg reveal">See what's missing.<br>Collect what matters.</h2>
 
@@ -159,12 +184,12 @@
   </section>
 
   <!-- ========== HOW IT WORKS ========== -->
-  <section class="how-section">
+  <section id="how" class="how-section">
     <div class="container">
       <h2 class="heading-lg reveal">Under the hood</h2>
 
       <div class="features reveal-group reveal">
-        <div class="feature reveal-child">
+        <div class="feature glass-card reveal-child">
           <div class="feature-icon">
             <svg viewBox="0 0 24 24">
               <rect x="2" y="2" width="20" height="20" rx="3"/>
@@ -179,7 +204,7 @@
           <p class="text-body">Every video becomes a 512-dimensional vector in a shared multimodal space. Videos that look similar live close together. Videos that don't, live apart.</p>
         </div>
 
-        <div class="feature reveal-child">
+        <div class="feature glass-card reveal-child">
           <div class="feature-icon">
             <svg viewBox="0 0 24 24">
               <circle cx="6" cy="6" r="2"/>
@@ -198,7 +223,7 @@
           <p class="text-body">KMeans groups your videos. UMAP collapses 512 dimensions into 2 so you can actually see the structure. Outliers light up. Sparse clusters get flagged.</p>
         </div>
 
-        <div class="feature reveal-child">
+        <div class="feature glass-card reveal-child">
           <div class="feature-icon">
             <svg viewBox="0 0 24 24">
               <path d="M12 2L2 7l10 5 10-5-10-5z"/>
@@ -214,7 +239,7 @@
   </section>
 
   <!-- ========== EXAMPLE OUTPUT ========== -->
-  <section class="output-section">
+  <section id="output" class="output-section">
     <div class="container">
       <h2 class="heading-lg reveal">What you get</h2>
 
@@ -243,7 +268,7 @@
 <span class="sym-miss">✗</span> <span class="text-white">"Emergency evacuation"</span>             — max similarity: <span class="sym-miss">0.12</span> <span class="text-dim">(NO MATCH)</span>
 <span class="sym-miss">✗</span> <span class="text-white">"Fire or smoke detection"</span>          — max similarity: <span class="sym-miss">0.09</span> <span class="text-dim">(NO MATCH)</span>
 
-<span class="text-dim">Coverage Score:</span> <span class="sym-warn">62%</span>
+<span class="text-dim">Coverage Score:</span> <span class="sym-warn coverage-counter" data-target="62">0%</span>
 <span class="text-dim">Recommendation:</span> <span class="text-white">Collect data for 3 missing categories.</span>
 <span class="text-dim">═══════════════════════════════════════════════</span></pre>
       </div>
@@ -251,7 +276,7 @@
   </section>
 
   <!-- ========== WHY IT MATTERS ========== -->
-  <section class="domains-section">
+  <section id="domains" class="domains-section">
     <div class="container">
       <h2 class="heading-lg reveal">Built for domains where data is scarce and stakes are high</h2>
 
@@ -308,7 +333,7 @@
   </section>
 
   <!-- ========== TECH STACK ========== -->
-  <section class="stack-section">
+  <section id="stack" class="stack-section">
     <div class="container">
       <h2 class="heading-lg reveal">Built with</h2>
 
@@ -323,8 +348,60 @@
     </div>
   </section>
 
+  <!-- ========== QUICK START ========== -->
+  <section id="quickstart" class="quickstart-section">
+    <div class="container">
+      <h2 class="heading-lg reveal">Get running in 60 seconds</h2>
+
+      <div class="quickstart-grid reveal">
+        <div class="quickstart-steps">
+          <div class="qs-step">
+            <span class="qs-num">1</span>
+            <div class="qs-content">
+              <h3 class="heading-md">Install</h3>
+              <p class="text-body">Clone the repo and install as a FiftyOne plugin.</p>
+            </div>
+          </div>
+          <div class="qs-step">
+            <span class="qs-num">2</span>
+            <div class="qs-content">
+              <h3 class="heading-md">Configure</h3>
+              <p class="text-body">Set your Twelve Labs API key (free tier: 600 min indexing).</p>
+            </div>
+          </div>
+          <div class="qs-step">
+            <span class="qs-num">3</span>
+            <div class="qs-content">
+              <h3 class="heading-md">Run</h3>
+              <p class="text-body">Launch the demo to see the full pipeline on real data.</p>
+            </div>
+          </div>
+        </div>
+        <div class="quickstart-terminal">
+          <div class="report-dots" aria-hidden="true">
+            <span class="dot-red"></span>
+            <span class="dot-yellow"></span>
+            <span class="dot-green"></span>
+            <span class="qs-terminal-title">Terminal</span>
+          </div>
+          <pre><code><span class="qs-comment"># Clone &amp; install</span>
+git clone https://github.com/rishimule/video-content-gap-analyzer.git
+cd video-content-gap-analyzer
+pip install -r requirements.txt
+fiftyone plugins create video-content-gap-analyzer --from-dir .
+
+<span class="qs-comment"># Set API key</span>
+export TWELVELABS_API_KEY=<span class="qs-string">"your_key_here"</span>
+
+<span class="qs-comment"># Run demo</span>
+python demo.py</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- ========== TEAM ========== -->
-  <section class="team-section">
+  <section id="team" class="team-section">
     <div class="container">
       <h2 class="heading-lg reveal">Meet the Gap Seekers</h2>
 

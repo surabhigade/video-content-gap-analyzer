@@ -2,6 +2,13 @@
    Video Content Gap Analyzer — Landing Page Styles
    ============================================================ */
 
+/* --- Animated gradient border custom property --- */
+@property --terminal-border-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
 /* --- Light Theme (Default) --- */
 :root {
   --bg: #ffffff;
@@ -103,6 +110,19 @@ section {
   position: relative;
 }
 
+/* Scroll margin for fixed navbar */
+section[id] {
+  scroll-margin-top: 80px;
+}
+
+/* --- Alternating Section Backgrounds --- */
+.problem-section,
+.how-section,
+.quickstart-section,
+.team-section {
+  background: var(--bg-elevated);
+}
+
 /* --- Color transition for themed elements --- */
 section, .stat-block, .pipeline-icon, .domain-icon,
 .nav, .footer, .report-block::before {
@@ -155,6 +175,17 @@ section, .stat-block, .pipeline-icon, .domain-icon,
   background-clip: text;
 }
 
+/* Animated hero gradient */
+.hero .heading-xl.text-gradient {
+  background-size: 200% 200%;
+  animation: gradient-shift 6s ease-in-out infinite;
+}
+
+@keyframes gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
 /* --- Links --- */
 a {
   color: var(--accent);
@@ -205,10 +236,80 @@ a:hover {
   letter-spacing: -0.01em;
   text-decoration: none;
   transition: color 0.4s ease;
+  flex-shrink: 0;
 }
 .nav-brand:hover {
   opacity: 1;
   color: var(--accent);
+}
+
+/* --- Nav Links (section navigation) --- */
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.nav-link {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-muted);
+  padding: 6px 14px;
+  border-radius: 8px;
+  transition: color 0.2s ease, background 0.2s ease;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.nav-link:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+  opacity: 1;
+}
+
+.nav-link.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* Hamburger (hidden on desktop) */
+.nav-hamburger {
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  width: 36px;
+  height: 36px;
+  padding: 8px 6px;
+  border: none;
+  border-radius: 10px;
+  background: var(--icon-bg);
+  cursor: pointer;
+  transition: background 0.3s ease;
+}
+
+.nav-hamburger:hover {
+  background: var(--accent-soft);
+}
+
+.nav-hamburger span {
+  display: block;
+  height: 2px;
+  background: var(--text-muted);
+  border-radius: 1px;
+  transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+.nav-hamburger.open span:nth-child(1) {
+  transform: translateY(7px) rotate(45deg);
+}
+
+.nav-hamburger.open span:nth-child(2) {
+  opacity: 0;
+}
+
+.nav-hamburger.open span:nth-child(3) {
+  transform: translateY(-7px) rotate(-45deg);
 }
 
 .nav-actions {
@@ -313,6 +414,72 @@ a:hover {
   transition: background 0.6s ease;
 }
 
+/* --- Hero Floating Orbs --- */
+.hero-orbs {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.12;
+  will-change: transform;
+}
+
+[data-theme="dark"] .orb {
+  opacity: 0.18;
+}
+
+.orb-1 {
+  width: 400px;
+  height: 400px;
+  background: var(--accent);
+  top: 10%;
+  left: 15%;
+  animation: float-orb-1 18s ease-in-out infinite;
+}
+
+.orb-2 {
+  width: 300px;
+  height: 300px;
+  background: #818cf8;
+  top: 50%;
+  right: 10%;
+  animation: float-orb-2 22s ease-in-out infinite;
+}
+
+.orb-3 {
+  width: 250px;
+  height: 250px;
+  background: #a78bfa;
+  bottom: 15%;
+  left: 40%;
+  animation: float-orb-3 20s ease-in-out infinite;
+}
+
+@keyframes float-orb-1 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(60px, -40px) scale(1.1); }
+  66% { transform: translate(-30px, 50px) scale(0.95); }
+}
+
+@keyframes float-orb-2 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(-50px, 30px) scale(1.05); }
+  66% { transform: translate(40px, -60px) scale(0.9); }
+}
+
+@keyframes float-orb-3 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(40px, 50px) scale(1.1); }
+  66% { transform: translate(-60px, -20px) scale(0.95); }
+}
+
 .hero-content {
   display: flex;
   flex-direction: column;
@@ -342,6 +509,97 @@ a:hover {
   color: var(--text-muted);
   margin-top: 8px;
   letter-spacing: 0.04em;
+}
+
+/* --- CTA Buttons --- */
+.hero-cta {
+  display: flex;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 28px;
+  border-radius: 14px;
+  font-size: 16px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.2s var(--ease-out-expo), box-shadow 0.2s ease;
+}
+
+.btn::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at var(--ripple-x, 50%) var(--ripple-y, 50%), rgba(255,255,255,0.25) 0%, transparent 60%);
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+
+.btn:hover::after {
+  opacity: 1;
+}
+
+.btn svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.2s ease;
+}
+
+.btn-primary svg {
+  transition: transform 0.2s ease;
+}
+
+.btn-primary:hover svg {
+  transform: translateX(3px);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 4px 24px rgba(99, 102, 241, 0.3);
+}
+
+.btn-primary:hover {
+  opacity: 1;
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(99, 102, 241, 0.4);
+}
+
+.btn-primary:active {
+  transform: translateY(0) scale(0.97);
+}
+
+.btn-secondary {
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  opacity: 1;
+  transform: translateY(-2px);
+  background: var(--bg-subtle);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+}
+
+[data-theme="dark"] .btn-secondary:hover {
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.btn-secondary:active {
+  transform: translateY(0) scale(0.97);
 }
 
 .scroll-indicator {
@@ -441,9 +699,19 @@ a:hover {
   top: 32px;
   right: -10%;
   width: 20%;
-  height: 1px;
-  background: linear-gradient(90deg, var(--text-muted), transparent);
-  opacity: 0.3;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), rgba(99, 102, 241, 0.2));
+  opacity: 0;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: opacity 0.5s ease, transform 0.6s var(--ease-out-expo);
+  transition-delay: var(--connector-delay, 0ms);
+}
+
+/* Connectors animate in after the pipeline becomes visible */
+.reveal-group.visible .pipeline-step:not(:last-child)::after {
+  opacity: 1;
+  transform: scaleX(1);
 }
 
 .pipeline-icon {
@@ -497,7 +765,44 @@ a:hover {
 .features {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 64px;
+  gap: 32px;
+}
+
+/* --- Glass Card Effect --- */
+.glass-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 40px 32px;
+  transition: transform 0.35s var(--ease-out-expo),
+              box-shadow 0.35s var(--ease-out-expo),
+              border-color 0.35s ease,
+              background 0.4s ease;
+}
+
+[data-theme="dark"] .glass-card {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.06);
+}
+
+/* Elevated bg for cards inside elevated sections */
+.how-section .glass-card {
+  background: var(--bg);
+}
+
+[data-theme="dark"] .how-section .glass-card {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.glass-card:hover {
+  transform: translateY(-6px);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.08);
+  border-color: rgba(99, 102, 241, 0.2);
+}
+
+[data-theme="dark"] .glass-card:hover {
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+  border-color: rgba(129, 140, 248, 0.15);
 }
 
 .feature-icon {
@@ -537,15 +842,32 @@ a:hover {
   padding: 48px;
   overflow-x: auto;
   position: relative;
+  isolation: isolate;
 }
 
+/* Animated gradient border */
 .report-block::before {
   content: '';
   position: absolute;
   inset: 0;
   border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 1px;
+  background: linear-gradient(
+    var(--terminal-border-angle, 0deg),
+    #6366f1,
+    #818cf8,
+    #a78bfa,
+    #6366f1
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
   pointer-events: none;
+  animation: border-rotate 4s linear infinite;
+}
+
+@keyframes border-rotate {
+  to { --terminal-border-angle: 360deg; }
 }
 
 /* Terminal window dots */
@@ -609,6 +931,12 @@ a:hover {
   flex-direction: column;
   align-items: center;
   gap: 16px;
+  cursor: default;
+  transition: transform 0.3s var(--ease-out-expo);
+}
+
+.domain:hover {
+  transform: translateY(-4px);
 }
 
 .domain-icon {
@@ -619,6 +947,17 @@ a:hover {
   justify-content: center;
   border-radius: 14px;
   background: var(--icon-bg);
+  transition: background 0.3s ease, transform 0.3s var(--ease-out-expo), box-shadow 0.3s ease;
+}
+
+.domain:hover .domain-icon {
+  background: var(--accent-soft);
+  transform: scale(1.1);
+  box-shadow: 0 8px 24px rgba(99, 102, 241, 0.15);
+}
+
+[data-theme="dark"] .domain:hover .domain-icon {
+  box-shadow: 0 8px 24px rgba(99, 102, 241, 0.25);
 }
 
 .domain-icon svg {
@@ -660,26 +999,137 @@ a:hover {
   justify-content: center;
   align-items: center;
   flex-wrap: wrap;
-  gap: 16px 40px;
+  gap: 16px;
 }
 
 .stack-item {
-  font-size: 17px;
+  font-size: 15px;
   font-weight: 500;
   color: var(--text-secondary);
   position: relative;
+  padding: 8px 20px;
+  border-radius: 100px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  transition: transform 0.2s ease, border-color 0.2s ease, color 0.2s ease, background 0.4s ease;
 }
 
-.stack-item:not(:last-child)::after {
+.stack-item:hover {
+  transform: translateY(-2px);
+  border-color: rgba(99, 102, 241, 0.25);
+  color: var(--accent);
+}
+
+/* ============================================================
+   QUICK START
+   ============================================================ */
+.quickstart-section .heading-lg {
+  margin-bottom: 64px;
+}
+
+.quickstart-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 48px;
+  align-items: start;
+}
+
+.quickstart-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+.qs-step {
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+}
+
+.qs-num {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 16px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+
+.qs-content .heading-md {
+  margin-bottom: 6px;
+}
+
+.qs-content .text-body {
+  font-size: 16px;
+}
+
+/* Quick Start Terminal */
+.quickstart-terminal {
+  background: #111111;
+  border-radius: 16px;
+  padding: 32px;
+  position: relative;
+  isolation: isolate;
+}
+
+/* Reuse animated border from main terminal */
+.quickstart-terminal::before {
   content: '';
   position: absolute;
-  right: -22px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--text-muted);
+  inset: 0;
+  border-radius: 16px;
+  padding: 1px;
+  background: linear-gradient(
+    var(--terminal-border-angle, 0deg),
+    #6366f1, #818cf8, #a78bfa, #6366f1
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  animation: border-rotate 4s linear infinite;
+}
+
+.quickstart-terminal .report-dots {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.qs-terminal-title {
+  font-size: 13px;
+  color: #6e6e73;
+  margin-left: 8px;
+  font-family: var(--font-sans);
+}
+
+.quickstart-terminal pre {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.8;
+  color: #f5f5f7;
+  white-space: pre;
+  margin: 0;
+  overflow-x: auto;
+}
+
+.quickstart-terminal code {
+  font-family: inherit;
+}
+
+.qs-comment {
+  color: #6e6e73;
+}
+
+.qs-string {
+  color: #34d399;
 }
 
 /* ============================================================
@@ -888,7 +1338,7 @@ a:hover {
 
   .features {
     grid-template-columns: 1fr;
-    gap: 48px;
+    gap: 24px;
   }
 
   .pipeline {
@@ -917,6 +1367,40 @@ a:hover {
     padding: 24px;
     border-radius: 12px;
   }
+
+  /* Nav links become dropdown on mobile */
+  .nav-links {
+    display: none;
+    position: absolute;
+    top: 56px;
+    left: 0;
+    right: 0;
+    flex-direction: column;
+    background: var(--nav-bg);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    gap: 4px;
+  }
+
+  .nav-links.open {
+    display: flex;
+  }
+
+  .nav-hamburger {
+    display: flex;
+  }
+
+  /* Quick Start */
+  .quickstart-grid {
+    grid-template-columns: 1fr;
+    gap: 40px;
+  }
+
+  .quickstart-terminal {
+    padding: 24px;
+  }
 }
 
 @media (max-width: 600px) {
@@ -938,12 +1422,8 @@ a:hover {
     margin-bottom: 48px;
   }
 
-  .stack-item:not(:last-child)::after {
-    display: none;
-  }
-
   .stack-list {
-    gap: 12px 32px;
+    gap: 12px;
   }
 
   .back-to-top {
@@ -951,5 +1431,15 @@ a:hover {
     right: 20px;
     width: 40px;
     height: 40px;
+  }
+
+  .hero-cta {
+    flex-direction: column;
+    width: 100%;
+    max-width: 300px;
+  }
+
+  .btn {
+    justify-content: center;
   }
 }
