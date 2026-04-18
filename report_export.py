@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from .gap_report import (
+    CLUSTER_STATUS_COLORS,
     HISTORY_INFO_KEY,
     build_coverage_history_entry,
     build_tiered_report,
@@ -120,7 +121,23 @@ tr.sev-critical td:nth-child(2) { color: var(--critical); font-weight: 600; }
 tr.sev-moderate td:nth-child(2) { color: var(--moderate); font-weight: 600; }
 .sev-low td.severity,
 tr.sev-low td:nth-child(2)      { color: var(--low); }
-tr.status-sparse td:nth-child(3) { color: var(--critical); font-weight: 600; }
+/* Consistent cluster-health colours — mirror the scatter-plot markers so a
+   glance at the plot lines up with the report tables. */
+tr.status-well-covered td:nth-child(3) { color: #2e7d32; font-weight: 600; }
+tr.status-thin         td:nth-child(3) { color: #f9a825; font-weight: 600; }
+tr.status-sparse       td:nth-child(3) { color: #c62828; font-weight: 700; }
+tr.status-noise        td:nth-child(3) { color: #8a8a8a; }
+.status-legend {
+  font-size: 13px;
+  color: var(--muted);
+  margin: 4px 0 10px;
+}
+.status-legend .dot {
+  display: inline-block;
+  width: 10px; height: 10px; border-radius: 50%;
+  margin: 0 4px 0 12px; vertical-align: middle;
+}
+.status-legend .dot:first-child { margin-left: 0; }
 .download-link {
   display: inline-block;
   padding: 6px 14px;
@@ -423,17 +440,43 @@ def _render_priority_table(t2_rows: list) -> str:
     )
 
 
-def _render_cluster_table(clusters: list) -> str:
+_STATUS_LEGEND_ORDER = ["well-covered", "thin", "sparse", "noise"]
+_STATUS_LEGEND_LABELS = {
+    "well-covered": "well-covered (≥6)",
+    "thin":         "thin (3–5)",
+    "sparse":       "sparse (<3)",
+    "noise":        "noise",
+}
+
+
+def _render_status_legend(colors: dict) -> str:
+    """Inline 4-dot legend so readers link table colour ↔ plot colour."""
+    parts = ["<p class='status-legend'><strong>Status:</strong>"]
+    for status in _STATUS_LEGEND_ORDER:
+        color = colors.get(status, "#999")
+        label = _STATUS_LEGEND_LABELS[status]
+        parts.append(
+            f"<span class='dot' style='background:{color}'></span>"
+            f"{escape(label)}"
+        )
+    parts.append("</p>")
+    return "".join(parts)
+
+
+def _render_cluster_table(clusters: list, status_colors: dict) -> str:
     if not clusters:
         return "<p><em>No per-cluster data.</em></p>"
     rows_html = []
     for c in clusters:
-        status_cls = "status-sparse" if c["status"] == "sparse" else "status-ok"
+        # Status comes from gap_report.classify_cluster_health, one of:
+        # well-covered | thin | sparse | noise. The CSS painted each row's
+        # status cell in the matching colour.
+        status_cls = f"status-{c['status']}"
         rows_html.append(
             f"<tr class='{status_cls}'>"
             f"<td>{c['cluster_id']}</td>"
             f"<td>{c['size']}</td>"
-            f"<td>{c['status']}</td>"
+            f"<td>{escape(c['status'])}</td>"
             f"<td>{c['mean_centroid_distance']:.3f}</td>"
             f"<td>{c['max_centroid_distance']:.3f}</td>"
             f"<td>{escape(c['cluster_label'] or '')}</td>"
@@ -441,7 +484,8 @@ def _render_cluster_table(clusters: list) -> str:
             f"</tr>"
         )
     return (
-        "<table class='cluster-table'>"
+        _render_status_legend(status_colors)
+        + "<table class='cluster-table'>"
         "<thead><tr>"
         "<th>Cluster</th><th>Size</th><th>Status</th>"
         "<th>Mean centroid dist</th><th>Max centroid dist</th>"
@@ -588,7 +632,7 @@ def _render_html(
         "<h2>Tier 3 — Full Breakdown</h2>\n"
         f"<p>{csv_link}</p>\n"
         "<h3>Per-cluster statistics</h3>\n"
-        f"{_render_cluster_table(t3['clusters'])}\n"
+        f"{_render_cluster_table(t3['clusters'], CLUSTER_STATUS_COLORS)}\n"
         f"{outliers_html}\n"
         f"{_render_wellcovered_table(t3['well_covered_categories'])}\n"
         "</section>\n"

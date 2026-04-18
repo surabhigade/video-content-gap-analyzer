@@ -30,6 +30,49 @@ logger = logging.getLogger(__name__)
 # analyze operator writes; the show/export operators read) stay in sync.
 HISTORY_INFO_KEY = "coverage_history"
 
+# Cluster-health colour scheme — kept here so the CoveragePanel scatter plot,
+# the ShowGapReport operator output, and the HTML export all speak the same
+# visual language. A user should glance at the plot and immediately know
+# which clusters match which rows in the report.
+CLUSTER_STATUS_COLORS = {
+    "well-covered": "#2e7d32",  # green
+    "thin":         "#f9a825",  # amber
+    "sparse":       "#c62828",  # red
+    "noise":        "#8a8a8a",  # gray
+}
+
+# Coloured-dot prefixes used wherever we can't style a cell directly (FO
+# TableViews, plain markdown). The colour order matches CLUSTER_STATUS_COLORS.
+CLUSTER_STATUS_EMOJI = {
+    "well-covered": "🟢",
+    "thin":         "🟡",
+    "sparse":       "🔴",
+    "noise":        "⚫",
+}
+
+# A cluster with 3–5 samples is "thin": big enough for HDBSCAN to hold on to
+# but small enough that adding a few videos would materially strengthen it.
+# Below 3 is already flagged as sparse by detect_sparse_clusters.
+CLUSTER_THIN_MAX = 5
+
+
+def classify_cluster_health(size: int, cluster_id: int) -> str:
+    """Bucket a cluster into well-covered / thin / sparse / noise.
+
+    The thresholds mirror the rest of the plugin:
+      - size < 3  → sparse   (same as SPARSE_THRESHOLD in __init__.py)
+      - 3 ≤ size ≤ 5 → thin
+      - size ≥ 6  → well-covered
+      - cluster_id == -1 → noise (size doesn't matter)
+    """
+    if cluster_id == -1:
+        return "noise"
+    if size < 3:
+        return "sparse"
+    if size <= CLUSTER_THIN_MAX:
+        return "thin"
+    return "well-covered"
+
 # ------------------------------------------------------------
 # Quality / severity thresholds
 # ------------------------------------------------------------
@@ -402,12 +445,6 @@ def build_full_breakdown(gap_report: dict, dataset=None) -> dict:
                 continue
             by_cluster[int(cid)].append((sample, dist))
 
-        sparse_ids = {
-            int(sc["cluster_id"])
-            for sc in gap_report.get("sparse_clusters", []) or []
-            if sc.get("cluster_id") is not None
-        }
-
         for cid in sorted(by_cluster.keys()):
             rows = by_cluster[cid]
             if cid == -1:
@@ -432,6 +469,12 @@ def build_full_breakdown(gap_report: dict, dataset=None) -> dict:
                 except Exception:
                     pass
 
+            # 4-bucket health: well-covered / thin / sparse / noise.
+            # Uses the same thresholds the sparse-cluster detector already
+            # applies (<3 = sparse), and adds an intermediate "thin" bucket
+            # for 3–5 samples so the panel + report can highlight clusters
+            # that are present but underpowered.
+            status = classify_cluster_health(size, cid)
             clusters_info.append({
                 "cluster_id": cid,
                 "size": size,
@@ -439,7 +482,8 @@ def build_full_breakdown(gap_report: dict, dataset=None) -> dict:
                 "cluster_diversity": diversity,
                 "mean_centroid_distance": round(mean_d, 4),
                 "max_centroid_distance": round(max_d, 4),
-                "status": "sparse" if cid in sparse_ids else "well-covered",
+                "status": status,
+                "status_color": CLUSTER_STATUS_COLORS[status],
             })
 
     well_covered = []
@@ -578,6 +622,15 @@ def render_tiered_report_md(tiered: dict) -> str:
     if t3["clusters"]:
         lines.append("### Per-cluster statistics")
         lines.append("")
+        # Legend so readers link emoji ↔ health bucket ↔ scatter plot colour.
+        lines.append(
+            "Status legend: "
+            f"{CLUSTER_STATUS_EMOJI['well-covered']} well-covered (≥6) · "
+            f"{CLUSTER_STATUS_EMOJI['thin']} thin (3–5) · "
+            f"{CLUSTER_STATUS_EMOJI['sparse']} sparse (<3) · "
+            f"{CLUSTER_STATUS_EMOJI['noise']} noise"
+        )
+        lines.append("")
         lines.append(
             "| Cluster | Size | Status | Mean dist | Max dist | Label | Diversity |"
         )
@@ -585,9 +638,9 @@ def render_tiered_report_md(tiered: dict) -> str:
             "|---------|------|--------|-----------|----------|-------|-----------|"
         )
         for c in t3["clusters"]:
-            status = "**SPARSE**" if c["status"] == "sparse" else "OK"
+            emoji = CLUSTER_STATUS_EMOJI.get(c["status"], "")
             lines.append(
-                f"| {c['cluster_id']} | {c['size']} | {status} "
+                f"| {c['cluster_id']} | {c['size']} | {emoji} {c['status']} "
                 f"| {c['mean_centroid_distance']:.3f} "
                 f"| {c['max_centroid_distance']:.3f} "
                 f"| {_truncate(c['cluster_label'], 40)} "
