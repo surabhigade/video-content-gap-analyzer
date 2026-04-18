@@ -10,7 +10,9 @@ embeddings and Pegasus descriptions. Two operators:
 
 import os
 import time
+import asyncio
 import logging
+import threading
 from typing import Optional
 from datetime import datetime
 from collections import defaultdict
@@ -20,15 +22,43 @@ import fiftyone as fo
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
 from fiftyone.operators.panel import Panel, PanelConfig
+from scipy.spatial import ConvexHull, Voronoi
+from scipy.spatial.qhull import QhullError
+from scipy.stats import gaussian_kde
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
 from sklearn.metrics.pairwise import cosine_distances, cosine_similarity
 from sklearn.preprocessing import normalize
+import hdbscan
 import umap
 
-from twelvelabs import TwelveLabs, VideoInputRequest, MediaSource, TextInputRequest
+from twelvelabs import (
+    TwelveLabs,
+    AsyncTwelveLabs,
+    VideoInputRequest,
+    MediaSource,
+    TextInputRequest,
+)
 from twelvelabs.types import VideoContext_AssetId
 from twelvelabs.indexes import IndexesCreateRequestModelsItem
+
+from .embedding_cache import EmbeddingCache
+from .umap_model_cache import (
+    UMAP_RETRAIN_THRESHOLD,
+    load_umap_model,
+    save_umap_model,
+    should_retrain,
+)
+from .gap_report import (
+    CLUSTER_STATUS_COLORS,
+    CLUSTER_STATUS_EMOJI,
+    HISTORY_INFO_KEY,
+    build_coverage_history_entry,
+    build_tiered_report,
+    classify_cluster_health,
+    compute_coverage_diff,
+    render_tiered_report_md,
+)
+from .report_export import export_coverage_report
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +66,17 @@ logger = logging.getLogger(__name__)
 # Constants
 # ============================================================
 
-# Clustering
+# Clustering — HDBSCAN (default) parameters.
+# min_cluster_size matches SPARSE_THRESHOLD: any group smaller than this is
+# treated as noise by HDBSCAN anyway, so it's also our floor for "is this a
+# cluster at all?" Points HDBSCAN can't assign to any cluster are labeled -1
+# and surfaced as is_outlier=True on the sample.
+HDBSCAN_MIN_CLUSTER_SIZE = 3
+HDBSCAN_METRIC = "cosine"
+HDBSCAN_CLUSTER_SELECTION_METHOD = "eom"
+
+# KMeans fallback — used when the operator input num_clusters > 0. Keeps the
+# distance-threshold outlier heuristic the original pipeline relied on.
 KMEANS_N_INIT = 10
 KMEANS_RANDOM_STATE = 42
 OUTLIER_STD_FACTOR = 2.0
@@ -47,21 +87,83 @@ UMAP_METRIC = "cosine"
 UMAP_MIN_DIST = 0.1
 UMAP_RANDOM_STATE = 42
 
-# Pegasus descriptions
-REPS_PER_CLUSTER = 2
-INDEX_NAME_PREFIX = "gap-analyzer"
-PEGASUS_PROMPT = (
-    "Describe the main activity, setting, and key objects visible "
-    "in this video in one concise sentence."
+# Pegasus descriptions — sample up to this many reps per cluster in a
+# diverse mix: the 2 closest to the centroid (prototypical), 1 from the
+# cluster boundary (atypical for the cluster), and 1 random sample.
+PEGASUS_REPS_NEAREST = 2
+PEGASUS_REPS_BOUNDARY = 1
+PEGASUS_REPS_RANDOM = 1
+PEGASUS_REPS_TOTAL = (
+    PEGASUS_REPS_NEAREST + PEGASUS_REPS_BOUNDARY + PEGASUS_REPS_RANDOM
 )
+
+# Seed the per-cluster random picker so descriptions are reproducible
+# across re-runs on the same dataset.
+PEGASUS_RANDOM_SEED = 42
+
+INDEX_NAME_PREFIX = "gap-analyzer"
+
+# Structured prompt — the two labeled sections drive two FiftyOne fields:
+# ``cluster_label`` holds the aggregated COMMON descriptions, and
+# ``cluster_diversity`` holds the aggregated VARIATION notes. Keeping the
+# labels explicit lets us parse even when Pegasus runs the two sections
+# together on one line.
+PEGASUS_PROMPT = (
+    "Describe this video in two labeled sections:\n"
+    "COMMON: a single concise sentence about the main activity, setting, "
+    "and key objects — the kind of detail that would likely hold for other "
+    "videos of the same topic.\n"
+    "VARIATION: a brief phrase (a few words) naming any distinctive element "
+    "that could vary within a group of similar videos — unusual angle, "
+    "specific subject detail, lighting, or timing. If nothing stands out, "
+    "say 'typical example'."
+)
+
 POLL_INTERVAL = 10.0
 RATE_LIMIT_WAIT = 30
+
+# Phase 6.3 — retry policy for every Twelve Labs call (both Marengo embed
+# and Pegasus analyze). "3 retries" = 3 re-attempts after the initial call,
+# for a max of 4 attempts total. Delays: 2s → 4s → 8s between attempts
+# (capped at 3 waits), so worst-case added latency per call is 14s before
+# a permanent failure is recorded.
+API_MAX_RETRIES = 3
+API_INITIAL_BACKOFF = 2.0
 
 # Gap detection
 SPARSE_THRESHOLD = 3
 GAP_SIMILARITY_THRESHOLD = 0.30
 ISOLATION_STD_FACTOR = 1.5
-COVERAGE_GRID_SIZE = 10
+
+# Voronoi coverage — cells smaller than `median_area * VORONOI_CELL_THRESHOLD_FACTOR`
+# are treated as "well-covered" (dense region). Coverage is the fraction of the
+# convex hull's area these small cells occupy. 1.5 × median keeps the threshold
+# self-calibrating: dataset density varies, but the median does too.
+VORONOI_CELL_THRESHOLD_FACTOR = 1.5
+
+# Coverage panel — 2-D kernel density estimation grid resolution for the
+# heatmap layer rendered under the UMAP scatter. 80×80 samples the density
+# finely enough to surface small gaps while keeping the state payload and
+# Plotly render time well under a second on typical datasets.
+KDE_GRID_SIZE = 80
+
+# Gap-priority scoring — three weights that blend into a [0, 100] score
+# attached to every detected gap so the report can sort by importance.
+#   distance:  how far (cosine) the gap sits from the nearest cluster
+#   expected:  hard yes/no boost for user-listed categories
+#   isolation: the nearest cluster's own distance to its nearest peer —
+#              gaps in sparse regions are harder to fill and rank higher
+# Weights are linearly normalized; the defaults sum to 1.0. Edit these
+# constants (or pass ``weights`` to score_gap_priority directly) to rebalance
+# what the report treats as most important.
+GAP_PRIORITY_WEIGHT_DISTANCE = 0.5
+GAP_PRIORITY_WEIGHT_EXPECTED = 0.3
+GAP_PRIORITY_WEIGHT_ISOLATION = 0.2
+
+# Embedding concurrency — caps simultaneous Twelve Labs embed calls.
+# Matches Marengo's documented rate-limit headroom; raise only if you're
+# on a higher tier.
+EMBED_CONCURRENCY = 5
 
 
 # ============================================================
@@ -80,127 +182,331 @@ def get_twelvelabs_client() -> TwelveLabs:
 
 
 # ============================================================
+# Phase 6.3 — retry helpers
+# ============================================================
+# Every Twelve Labs call (Marengo embed, Pegasus analyze, asset upload,
+# indexing) runs through one of these two helpers so transient failures —
+# rate limits, network blips, brief server errors — don't cascade into
+# skipped samples. A permanent failure (all attempts exhausted) raises the
+# last exception so callers can record a per-sample ``embedding_error``
+# and move on without crashing the stage.
+
+def _retry_sync(
+    fn,
+    *,
+    operation: str = "API call",
+    max_retries: int = API_MAX_RETRIES,
+    initial_backoff: float = API_INITIAL_BACKOFF,
+):
+    """Call ``fn()`` with up to ``max_retries`` retries + exponential backoff.
+
+    Delays double between attempts (initial, 2×initial, 4×initial, …).
+    Total attempts = ``max_retries + 1``.
+    """
+    delay = initial_backoff
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries:
+                logger.warning(
+                    "%s failed (attempt %d/%d): %s — retrying in %.0fs",
+                    operation, attempt + 1, max_retries + 1, e, delay,
+                )
+                time.sleep(delay)
+                delay *= 2
+            else:
+                logger.warning(
+                    "%s failed permanently after %d attempts: %s",
+                    operation, max_retries + 1, e,
+                )
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _retry_async(
+    coro_fn,
+    *,
+    operation: str = "API call",
+    max_retries: int = API_MAX_RETRIES,
+    initial_backoff: float = API_INITIAL_BACKOFF,
+):
+    """Async variant of ``_retry_sync``. ``coro_fn`` must be a zero-arg async callable."""
+    delay = initial_backoff
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries:
+                logger.warning(
+                    "%s failed (attempt %d/%d): %s — retrying in %.0fs",
+                    operation, attempt + 1, max_retries + 1, e, delay,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                logger.warning(
+                    "%s failed permanently after %d attempts: %s",
+                    operation, max_retries + 1, e,
+                )
+    assert last_exc is not None
+    raise last_exc
+
+
+# ============================================================
 # Helper functions — Embedding (from notebook 01)
 # ============================================================
 
-def embed_sample(client: TwelveLabs, sample: fo.Sample) -> Optional[bool]:
-    """Embed a single video sample via Marengo 3.0.
+def _clear_sample_field_if_set(sample, field_name: str) -> None:
+    """Blank out a sample field iff it's currently populated.
 
-    Returns True on success, False on failure, None if skipped.
+    Used to clear a stale ``embedding_error`` the moment a subsequent run
+    succeeds, so the dataset doesn't carry forward misleading state. FO
+    rejects writing ``None`` to a field that doesn't yet exist in the
+    schema; checking first avoids that trap.
+    """
+    try:
+        existing = sample.get_field(field_name)
+    except Exception:
+        return
+    if existing:
+        try:
+            sample.set_field(field_name, "")
+        except Exception:
+            pass
+
+
+async def _embed_one_async(
+    client_async: AsyncTwelveLabs,
+    sample: fo.Sample,
+    cache: Optional[EmbeddingCache],
+    semaphore: asyncio.Semaphore,
+) -> tuple:
+    """Embed one sample via async Marengo. Returns ``(status, reason)``.
+
+    Status values:
+      - ``"api"`` — newly embedded
+      - ``"cache_hit"`` — disk cache hit
+      - ``"already_embedded"`` — field already set
+      - ``"failed"`` — retries exhausted; sample gets ``embedding_error``
+        stamped on it so users can filter for failed uploads
+
+    ``reason`` is ``None`` on success and a short human string on failure
+    so the orchestrator can tally error kinds for the end-of-stage report.
+    Cache + in-memory checks happen *outside* the semaphore so cached
+    samples don't consume concurrency slots.
     """
     filepath = sample.filepath
     filename = os.path.basename(filepath)
 
-    # Skip if already embedded
     try:
         if sample["embedding"] is not None:
-            return None
+            return "already_embedded", None
     except (KeyError, AttributeError):
         pass
 
-    try:
-        with open(filepath, "rb") as f:
-            asset = client.assets.create(method="direct", file=f)
+    if cache is not None:
+        cached = cache.get(filepath)
+        if cached is not None:
+            sample["embedding"] = cached.tolist()
+            _clear_sample_field_if_set(sample, "embedding_error")
+            sample.save()
+            return "cache_hit", None
 
-        response = client.embed.v_2.create(
+    async def _upload_asset():
+        # Re-open the file for each retry — the SDK may have consumed the
+        # previous handle partway through.
+        with open(filepath, "rb") as f:
+            return await client_async.assets.create(method="direct", file=f)
+
+    async def _run_embed(asset_id: str):
+        return await client_async.embed.v_2.create(
             input_type="video",
             model_name="marengo3.0",
             video=VideoInputRequest(
-                media_source=MediaSource(asset_id=asset.id),
+                media_source=MediaSource(asset_id=asset_id),
                 embedding_option=["visual", "audio"],
                 embedding_scope=["asset"],
                 embedding_type=["fused_embedding"],
             ),
         )
 
+    async with semaphore:
+        # Two separate retry blocks so a transient upload failure doesn't
+        # poison an otherwise-fine embed call, and vice versa.
+        try:
+            asset = await _retry_async(
+                _upload_asset,
+                operation=f"Marengo upload ({filename})",
+            )
+            response = await _retry_async(
+                lambda: _run_embed(asset.id),
+                operation=f"Marengo embed ({filename})",
+            )
+        except Exception as e:
+            reason = f"{type(e).__name__}: {str(e)[:200]}"
+            # Persist the failure on the sample so users can filter the
+            # dataset by embedding_error to investigate problems.
+            try:
+                sample.set_field("embedding_error", reason)
+                sample.save()
+            except Exception as save_err:
+                logger.warning(
+                    "Could not persist embedding_error on %s: %s",
+                    filename, save_err,
+                )
+            return "failed", reason
+
         embedding = response.data[0].embedding
         sample["embedding"] = embedding
+        _clear_sample_field_if_set(sample, "embedding_error")
         sample.save()
-        return True
 
-    except Exception as e:
-        logger.warning("Failed to embed %s: %s", filename, e)
-        return False
+        if cache is not None:
+            try:
+                cache.put(filepath, embedding)
+            except Exception as e:
+                logger.warning(
+                    "Failed to cache embedding for %s: %s", filename, e
+                )
+
+        return "api", None
 
 
-def embed_all_samples(
-    client: TwelveLabs, dataset: fo.Dataset, ctx
-) -> tuple:
-    """Embed all samples in dataset, reporting progress in the 0.0-0.25 range.
+async def _embed_all_async(dataset: fo.Dataset, ctx) -> tuple:
+    """Async orchestration for the embedding stage (0.00-0.25 of the run)."""
+    samples = list(dataset)
+    total = len(samples)
+    semaphore = asyncio.Semaphore(EMBED_CONCURRENCY)
 
-    Returns (success_count, fail_count, skip_count).
-    """
-    total = len(dataset)
-    success_count = 0
-    fail_count = 0
-    skip_count = 0
+    counts = {"api": 0, "cache_hit": 0, "already_embedded": 0, "failed": 0}
+    failure_reasons: dict = defaultdict(int)
+    completed = 0
 
-    for i, sample in enumerate(dataset):
-        filename = os.path.basename(sample.filepath)
-
-        result = embed_sample(client, sample)
-        if result is None:
-            skip_count += 1
-            status = "cached"
-        elif result:
-            success_count += 1
-            status = "done"
-        else:
-            fail_count += 1
-            status = "failed"
-
-        ctx.set_progress(
-            progress=0.25 * ((i + 1) / max(total, 1)),
-            label=f"Embedding video {i + 1}/{total} ({status}): {filename}",
+    api_key = os.environ.get("TWELVELABS_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "TWELVELABS_API_KEY environment variable is not set."
         )
 
+    async with AsyncTwelveLabs(api_key=api_key) as client_async:
+        with EmbeddingCache() as cache:
+            tasks = [
+                asyncio.create_task(
+                    _embed_one_async(client_async, s, cache, semaphore)
+                )
+                for s in samples
+            ]
+
+            # Update progress on each completion so the bar advances even
+            # though tasks finish out of order. Using as_completed instead of
+            # a loop counter is what makes progress correct under concurrency.
+            for coro in asyncio.as_completed(tasks):
+                result, reason = await coro
+                counts[result] += 1
+                if result == "failed" and reason:
+                    failure_reasons[reason] += 1
+                completed += 1
+                ctx.set_progress(
+                    progress=0.25 * (completed / max(total, 1)),
+                    label=(
+                        f"Embedding {completed}/{total} "
+                        f"({counts['api']} new, "
+                        f"{counts['cache_hit']} from cache, "
+                        f"{counts['already_embedded']} already embedded, "
+                        f"{counts['failed']} failed)"
+                    ),
+                )
+
     dataset.save()
-    return success_count, fail_count, skip_count
+
+    # End-of-stage resilience report — surface skip count + top reasons so
+    # operators know exactly how many videos were dropped and why. Stored
+    # on a dict so AnalyzeCoverage can also return it to the UI / log it.
+    if failure_reasons:
+        top = sorted(failure_reasons.items(), key=lambda kv: -kv[1])[:5]
+        logger.warning(
+            "Embedding stage: skipped %d sample(s). Top reasons: %s",
+            counts["failed"],
+            "; ".join(f"{r} ×{n}" for r, n in top),
+        )
+
+    return (
+        counts["api"],
+        counts["failed"],
+        counts["cache_hit"] + counts["already_embedded"],
+        counts["cache_hit"],
+        dict(failure_reasons),
+    )
+
+
+def embed_all_samples(dataset: fo.Dataset, ctx) -> tuple:
+    """Synchronous entry point used by AnalyzeCoverage.execute.
+
+    Wraps the async pipeline with ``asyncio.run`` unless we're already inside
+    a running event loop (some FiftyOne execution modes), in which case we
+    run it in a fresh thread with its own loop to avoid reentrancy errors.
+
+    Returns (api_count, failed_count, skipped_count, cache_hit_count,
+    failure_reasons). ``skipped_count`` includes both in-memory skips
+    (sample already had the embedding field set) and disk-cache hits;
+    ``cache_hit_count`` breaks out the latter for logging.
+    ``failure_reasons`` is a ``{reason_str: count}`` dict summarising
+    the permanent-retry failures for the end-of-stage resilience report.
+    """
+    try:
+        asyncio.get_running_loop()
+        in_running_loop = True
+    except RuntimeError:
+        in_running_loop = False
+
+    if not in_running_loop:
+        return asyncio.run(_embed_all_async(dataset, ctx))
+
+    result: dict = {}
+
+    def _runner() -> None:
+        try:
+            result["ok"] = asyncio.run(_embed_all_async(dataset, ctx))
+        except BaseException as e:
+            result["err"] = e
+
+    t = threading.Thread(target=_runner, name="embed-async-runner")
+    t.start()
+    t.join()
+
+    if "err" in result:
+        raise result["err"]
+    return result["ok"]
 
 
 # ============================================================
 # Helper functions — Clustering (from notebook 02)
 # ============================================================
 
-def find_optimal_k(embeddings_norm: np.ndarray, k_max: int = 10) -> int:
-    """Find the optimal number of clusters using silhouette score.
-
-    Tests k=2..min(k_max, n_samples-1) and returns the k with highest score.
-    Falls back to 2 if no valid k is found.
-    """
-    n_samples = len(embeddings_norm)
-    k_upper = min(k_max, n_samples - 1)
-
-    if k_upper < 2:
-        return 1
-
-    best_k = 2
-    best_score = -1.0
-
-    for k in range(2, k_upper + 1):
-        kmeans = KMeans(
-            n_clusters=k, random_state=KMEANS_RANDOM_STATE, n_init=KMEANS_N_INIT
-        )
-        labels = kmeans.fit_predict(embeddings_norm)
-        score = silhouette_score(embeddings_norm, labels, metric="cosine")
-        if score > best_score:
-            best_score = score
-            best_k = k
-
-    logger.info("Auto-selected k=%d (silhouette=%.3f)", best_k, best_score)
-    return best_k
-
 def run_clustering(
     dataset: fo.Dataset,
-    n_clusters: int,
+    n_clusters: int = 0,
     outlier_std_factor: float = OUTLIER_STD_FACTOR,
 ) -> tuple:
-    """Run KMeans clustering, outlier detection, and UMAP on embedded samples.
+    """Cluster the dataset's embeddings with HDBSCAN or KMeans, then UMAP.
 
-    Writes cluster_id, centroid_distance, is_outlier, umap_x, umap_y to each
-    sample. Returns the number of samples processed.
+    The ``n_clusters`` argument selects the algorithm:
+      * ``0`` (default) — HDBSCAN (density-based). Discovers clusters of
+        varying sizes, labels low-density points as noise (cluster_id=-1),
+        and writes ``cluster_confidence`` from its probabilities_ array.
+      * ``> 0`` — KMeans with that exact k. Every sample gets a cluster
+        (no noise label). Outliers are flagged by the classic heuristic
+        ``distance > mean + outlier_std_factor * std``; confidence is set
+        to 1.0 uniformly since KMeans has no native membership score.
+
+    Writes cluster_id, centroid_distance, is_outlier, cluster_confidence,
+    umap_x, umap_y to each sample. Returns (n_samples, n_clusters, n_noise).
     """
-    # Extract embedded samples
     samples_list = []
     embeddings_list = []
 
@@ -222,74 +528,173 @@ def run_clustering(
     embeddings = np.array(embeddings_list)
     embeddings_norm = normalize(embeddings, norm="l2")
 
-    # Auto-select k if requested (n_clusters == 0)
-    if n_clusters == 0:
-        n_clusters = find_optimal_k(embeddings_norm)
+    if n_clusters > 0:
+        # -------- KMeans fallback (explicit k from the user) --------
+        k = int(n_clusters)
+        if k > n_samples:
+            logger.warning(
+                "num_clusters (%d) > n_samples (%d), clamping", k, n_samples
+            )
+            k = max(1, n_samples - 1) if n_samples > 1 else 1
 
-    # Clamp n_clusters to valid range
-    if n_clusters > n_samples:
-        logger.warning(
-            "n_clusters (%d) > n_samples (%d), clamping", n_clusters, n_samples
-        )
-        n_clusters = max(1, n_samples - 1) if n_samples > 1 else 1
+        if k <= 1:
+            labels = np.zeros(n_samples, dtype=int)
+            centroids_norm = normalize(
+                embeddings_norm.mean(axis=0, keepdims=True), norm="l2"
+            )
+        else:
+            kmeans = KMeans(
+                n_clusters=k,
+                random_state=KMEANS_RANDOM_STATE,
+                n_init=KMEANS_N_INIT,
+            )
+            labels = kmeans.fit_predict(embeddings_norm)
+            centroids_norm = normalize(kmeans.cluster_centers_, norm="l2")
 
-    # KMeans
-    if n_clusters <= 1:
-        labels = np.zeros(n_samples, dtype=int)
-        centroids_norm = embeddings_norm.mean(axis=0, keepdims=True)
-        centroids_norm = normalize(centroids_norm, norm="l2")
+        distances = np.array([
+            cosine_distances(
+                embeddings_norm[i:i + 1],
+                centroids_norm[labels[i]:labels[i] + 1],
+            )[0, 0]
+            for i in range(n_samples)
+        ])
+
+        std_dist = distances.std()
+        if std_dist > 0:
+            threshold = distances.mean() + outlier_std_factor * std_dist
+            is_outlier = distances > threshold
+        else:
+            is_outlier = np.zeros(n_samples, dtype=bool)
+
+        # KMeans has no native membership score; 1.0 across the board signals
+        # "this algorithm doesn't distinguish confidence" without requiring
+        # downstream code to special-case a missing field.
+        probabilities = np.ones(n_samples, dtype=float)
     else:
-        kmeans = KMeans(
-            n_clusters=n_clusters, random_state=KMEANS_RANDOM_STATE,
-            n_init=KMEANS_N_INIT,
-        )
-        labels = kmeans.fit_predict(embeddings_norm)
-        centroids_norm = normalize(kmeans.cluster_centers_, norm="l2")
+        # -------- HDBSCAN default (density-based) --------
+        # HDBSCAN needs at least min_cluster_size samples to find anything;
+        # below that the library would raise. Short-circuit with a single
+        # trivial cluster and maximal confidence.
+        if n_samples < HDBSCAN_MIN_CLUSTER_SIZE:
+            labels = np.zeros(n_samples, dtype=int)
+            probabilities = np.ones(n_samples, dtype=float)
+        else:
+            # algorithm="generic" routes through sklearn.pairwise_distances,
+            # which is the only path that supports metric="cosine". The default
+            # BallTree backend rejects cosine outright.
+            clusterer = hdbscan.HDBSCAN(
+                min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+                metric=HDBSCAN_METRIC,
+                cluster_selection_method=HDBSCAN_CLUSTER_SELECTION_METHOD,
+                algorithm="generic",
+            )
+            labels = clusterer.fit_predict(embeddings_norm)
+            # probabilities_[i] is membership strength in [0, 1] for the
+            # assigned cluster; noise points get 0. Low-but-nonzero values
+            # mark samples sitting near a cluster boundary — a softer gap
+            # signal than -1.
+            probabilities = np.asarray(clusterer.probabilities_, dtype=float)
 
-    # Centroid distances
-    distances = np.array([
-        cosine_distances(
-            embeddings_norm[i:i + 1],
-            centroids_norm[labels[i]:labels[i] + 1],
-        )[0, 0]
-        for i in range(n_samples)
-    ])
+        unique_non_noise = np.sort(np.unique(labels[labels >= 0]))
 
-    mean_dist = distances.mean()
-    std_dist = distances.std()
+        # Mean centroid per non-noise cluster, L2-renormalized so cosine
+        # distance stays well-defined. Noise points get the distance to the
+        # *nearest* centroid — gives the Panel a meaningful "how far from any
+        # cluster" size.
+        distances = np.zeros(n_samples, dtype=float)
+        if len(unique_non_noise) > 0:
+            centroid_by_cid = {}
+            for cid in unique_non_noise:
+                mask = labels == cid
+                c = embeddings_norm[mask].mean(axis=0, keepdims=True)
+                centroid_by_cid[int(cid)] = normalize(c, norm="l2")[0]
 
-    # Outlier detection
-    if std_dist > 0:
-        threshold = mean_dist + outlier_std_factor * std_dist
-        is_outlier = distances > threshold
-    else:
-        is_outlier = np.zeros(n_samples, dtype=bool)
+            centroid_matrix = np.stack(list(centroid_by_cid.values()))
+            all_dists = cosine_distances(embeddings_norm, centroid_matrix)
 
-    # UMAP 2D reduction
-    if n_samples < 2:
+            cid_to_col = {cid: i for i, cid in enumerate(centroid_by_cid.keys())}
+            for i in range(n_samples):
+                if labels[i] >= 0:
+                    distances[i] = float(all_dists[i, cid_to_col[int(labels[i])]])
+                else:
+                    distances[i] = float(all_dists[i].min())
+
+        is_outlier = labels == -1
+
+    # Shared tail: recompute summary counts and run UMAP.
+    unique_non_noise = np.sort(np.unique(labels[labels >= 0]))
+    n_clusters = int(len(unique_non_noise))
+    n_noise = int(np.sum(labels == -1))
+
+    # UMAP 2D reduction. Needs n_neighbors >= 2 and at least 3 samples to
+    # form a meaningful manifold; below that we fall back to zero coords so
+    # downstream code that reads umap_x/umap_y still gets valid floats.
+    # The fitted reducer is also returned so stage 4 can project the
+    # category text embeddings into this same 2D space (Phase 5.2) —
+    # gap markers then land in real sparse regions of the plot rather
+    # than being snapped to their nearest cluster's mean.
+    # Phase 6.1 — disk-cached UMAP with incremental transform.
+    # Flow:
+    #   1. Try to load a previously-fitted UMAP for this dataset.
+    #   2. If we have one AND the dataset has drifted less than
+    #      UMAP_RETRAIN_THRESHOLD, reuse it and just .transform() the
+    #      current embeddings — O(n) instead of O(n²) retraining.
+    #   3. Otherwise (no cache, too much drift, or a load failure)
+    #      fit a fresh model and save it back to disk.
+    reducer: Optional[umap.UMAP] = None
+    current_ids = [str(s.id) for s in samples_list]
+
+    if n_samples < 3:
         coords_2d = np.zeros((n_samples, 2))
     else:
-        n_neighbors = min(5, n_samples - 1)
-        reducer = umap.UMAP(
-            n_components=UMAP_N_COMPONENTS,
-            metric=UMAP_METRIC,
-            n_neighbors=n_neighbors,
-            min_dist=UMAP_MIN_DIST,
-            random_state=UMAP_RANDOM_STATE,
-        )
-        coords_2d = reducer.fit_transform(embeddings_norm)
+        cached = load_umap_model(dataset.name) if n_samples > 0 else None
+        retrain = True
+        if cached is not None:
+            retrain, reason = should_retrain(
+                cached.get("sample_ids", []),
+                current_ids,
+                threshold=UMAP_RETRAIN_THRESHOLD,
+            )
+            logger.info("UMAP cache (%s): %s", cached.get("backend", "?"), reason)
+            if not retrain:
+                try:
+                    reducer = cached["reducer"]
+                    coords_2d = reducer.transform(embeddings_norm)
+                except Exception as e:
+                    logger.warning(
+                        "Cached UMAP.transform failed (%s); retraining from scratch",
+                        e,
+                    )
+                    retrain = True
 
-    # Write fields to samples
+        if retrain:
+            n_neighbors = min(5, n_samples - 1)
+            reducer = umap.UMAP(
+                n_components=UMAP_N_COMPONENTS,
+                metric=UMAP_METRIC,
+                n_neighbors=n_neighbors,
+                min_dist=UMAP_MIN_DIST,
+                random_state=UMAP_RANDOM_STATE,
+            )
+            coords_2d = reducer.fit_transform(embeddings_norm)
+            try:
+                save_umap_model(dataset.name, reducer, current_ids)
+            except Exception as e:
+                logger.warning(
+                    "Could not persist UMAP model for %s: %s", dataset.name, e
+                )
+
     for i, sample in enumerate(samples_list):
         sample["cluster_id"] = int(labels[i])
         sample["centroid_distance"] = float(distances[i])
         sample["is_outlier"] = bool(is_outlier[i])
+        sample["cluster_confidence"] = float(probabilities[i])
         sample["umap_x"] = float(coords_2d[i, 0])
         sample["umap_y"] = float(coords_2d[i, 1])
         sample.save()
 
     dataset.save()
-    return n_samples, n_clusters
+    return n_samples, n_clusters, n_noise, reducer
 
 
 # ============================================================
@@ -297,7 +702,21 @@ def run_clustering(
 # ============================================================
 
 def find_cluster_representatives(dataset: fo.Dataset) -> dict:
-    """For each cluster_id, find the REPS_PER_CLUSTER samples closest to centroid."""
+    """Pick a diverse set of representatives per (non-noise) cluster.
+
+    For each cluster we select, in order:
+      - ``PEGASUS_REPS_NEAREST`` samples closest to the centroid (prototypes)
+      - ``PEGASUS_REPS_BOUNDARY`` sample(s) at the cluster's far edge
+        (highest centroid distance — atypical-but-still-belongs)
+      - ``PEGASUS_REPS_RANDOM`` sample(s) drawn randomly from the rest
+        (captures variation the first three might miss)
+
+    Duplicates are skipped — a small cluster just gets however many unique
+    samples it can offer. Random draws are seeded per-cluster so the pick
+    is reproducible across re-runs on the same dataset.
+    """
+    import random as _random
+
     clusters = defaultdict(list)
 
     for sample in dataset:
@@ -306,25 +725,65 @@ def find_cluster_representatives(dataset: fo.Dataset) -> dict:
             dist = sample["centroid_distance"]
         except (KeyError, AttributeError):
             continue
-        if cid is not None and dist is not None:
+        # Skip HDBSCAN noise — describing "the stuff that didn't cluster" is
+        # never useful and would waste a Pegasus call on unrelated videos.
+        if cid is not None and cid != -1 and dist is not None:
             clusters[cid].append((dist, sample))
 
     representatives = {}
     for cid in sorted(clusters.keys()):
         sorted_samples = sorted(clusters[cid], key=lambda x: x[0])
-        representatives[cid] = [s for _, s in sorted_samples[:REPS_PER_CLUSTER]]
+        n = len(sorted_samples)
+
+        reps = []
+        chosen_ids = set()
+
+        def _add(sample) -> None:
+            if sample.id not in chosen_ids:
+                reps.append(sample)
+                chosen_ids.add(sample.id)
+
+        # 2 (or fewer) nearest-centroid samples — the prototype pair
+        for i in range(min(PEGASUS_REPS_NEAREST, n)):
+            _add(sorted_samples[i][1])
+
+        # 1 boundary sample — highest centroid distance within the cluster
+        for i in range(PEGASUS_REPS_BOUNDARY):
+            if n - 1 - i < 0:
+                break
+            _add(sorted_samples[-(i + 1)][1])
+
+        # 1 random sample from anything not yet chosen (deterministic seed)
+        remaining = [s for _, s in sorted_samples if s.id not in chosen_ids]
+        if remaining and PEGASUS_REPS_RANDOM > 0:
+            rng = _random.Random(PEGASUS_RANDOM_SEED + int(cid))
+            for _ in range(min(PEGASUS_REPS_RANDOM, len(remaining))):
+                pick = rng.choice(remaining)
+                _add(pick)
+                remaining.remove(pick)
+
+        representatives[cid] = reps
 
     return representatives
 
 
 def upload_asset(client: TwelveLabs, filepath: str) -> Optional[object]:
-    """Upload a video file as a Twelve Labs asset. Returns asset or None."""
-    try:
+    """Upload a video file as a Twelve Labs asset, with retries.
+
+    Re-opens the file on every retry attempt so the SDK always gets a
+    fresh handle. Returns the asset on success, or ``None`` after the
+    retry budget is exhausted.
+    """
+    filename = os.path.basename(filepath)
+
+    def _once():
         with open(filepath, "rb") as f:
-            asset = client.assets.create(method="direct", file=f)
-        return asset
+            return client.assets.create(method="direct", file=f)
+
+    try:
+        return _retry_sync(_once, operation=f"asset upload ({filename})")
     except Exception as e:
-        logger.warning("Upload failed for %s: %s", os.path.basename(filepath), e)
+        logger.warning("Upload failed permanently for %s: %s", filename, e)
         return None
 
 
@@ -383,69 +842,137 @@ def index_and_analyze(
     return response.data
 
 
+def parse_pegasus_response(text: str) -> tuple:
+    """Split a Pegasus COMMON/VARIATION labeled response into two strings.
+
+    Tolerates:
+      - either label missing
+      - labels in any case, with or without markdown bolding
+      - multi-line content (lines following a label belong to that label
+        until the next label shows up)
+      - entirely unlabeled text (falls back to ``(text, "")``)
+    """
+    if not text:
+        return "", ""
+
+    text = text.strip()
+    # Strip common markdown affordances Pegasus sometimes emits
+    cleaned = text.replace("**", "").replace("__", "")
+
+    buf = {"common": [], "variation": []}
+    current = None
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        upper = stripped.upper()
+        if upper.startswith("COMMON:"):
+            current = "common"
+            rest = stripped[len("COMMON:"):].strip()
+            if rest:
+                buf[current].append(rest)
+        elif upper.startswith("VARIATION:"):
+            current = "variation"
+            rest = stripped[len("VARIATION:"):].strip()
+            if rest:
+                buf[current].append(rest)
+        elif current is not None:
+            buf[current].append(stripped)
+
+    common = " ".join(buf["common"]).strip()
+    variation = " ".join(buf["variation"]).strip()
+
+    # Fallback: the model ignored labels — treat the whole reply as common.
+    if not common and not variation:
+        common = cleaned.strip()
+
+    return common, variation
+
+
 def generate_description(
     client: TwelveLabs, filepath: str, use_indexing: bool, index_id: Optional[str]
 ) -> tuple:
     """Generate a Pegasus description for a video.
 
-    Returns (description_or_None, use_indexing_updated).
-    Handles rate limits and approach fallback (A -> B).
+    Returns ``(common, variation, use_indexing_updated)`` where ``common``
+    and ``variation`` are the two parsed sections of the Pegasus reply
+    (either may be empty). On failure both strings are empty.
+
+    The direct ``analyze`` call (Approach A) and the index-then-analyze
+    call (Approach B) each get a full retry budget via ``_retry_sync``
+    (exponential backoff covers rate limits). When Approach A fails
+    permanently on a non-rate-limit error, the function signals
+    ``use_indexing_updated = True`` so the caller can retry via Approach B.
     """
     asset = upload_asset(client, filepath)
     if asset is None:
-        return None, use_indexing
+        return "", "", use_indexing
 
-    for attempt in range(2):
-        try:
-            if use_indexing:
-                text = index_and_analyze(client, index_id, asset.id, PEGASUS_PROMPT)
-            else:
-                text = analyze_via_asset(client, asset.id, PEGASUS_PROMPT)
+    filename = os.path.basename(filepath)
+    operation = (
+        f"Pegasus index+analyze ({filename})"
+        if use_indexing
+        else f"Pegasus analyze ({filename})"
+    )
 
-            if text:
-                return text.strip(), use_indexing
-            else:
-                return None, use_indexing
+    def _call():
+        if use_indexing:
+            return index_and_analyze(client, index_id, asset.id, PEGASUS_PROMPT)
+        return analyze_via_asset(client, asset.id, PEGASUS_PROMPT)
 
-        except Exception as e:
-            error_str = str(e).lower()
+    try:
+        text = _retry_sync(_call, operation=operation)
+    except Exception as e:
+        # Non-rate-limit, Approach-A failure after retries → try Approach B.
+        # Rate-limit-ish errors are already covered by the backoff, so if we
+        # hit them here we treat them like any other permanent failure.
+        error_str = str(e).lower()
+        is_rate_limit = (
+            "429" in str(e) or "rate" in error_str or "too many" in error_str
+        )
+        if not use_indexing and not is_rate_limit:
+            logger.info(
+                "%s failed; switching to index-based approach", operation
+            )
+            return "", "", True
+        logger.warning("Description generation failed: %s", e)
+        return "", "", use_indexing
 
-            # Rate limit: wait and retry once
-            if "429" in str(e) or "rate" in error_str or "too many" in error_str:
-                if attempt == 0:
-                    logger.info("Rate limited, waiting %ds...", RATE_LIMIT_WAIT)
-                    time.sleep(RATE_LIMIT_WAIT)
-                    continue
-                else:
-                    return None, use_indexing
+    if not text:
+        return "", "", use_indexing
 
-            # Non-rate-limit error on Approach A: switch to B
-            if not use_indexing:
-                logger.info("Direct analysis failed, switching to index-based approach")
-                return None, True
-
-            # Approach B failure
-            logger.warning("Description generation failed: %s", e)
-            return None, use_indexing
-
-    return None, use_indexing
+    common, variation = parse_pegasus_response(text)
+    return common, variation, use_indexing
 
 
 def generate_cluster_labels(
     client: TwelveLabs, dataset: fo.Dataset, use_pegasus: bool, ctx
 ) -> dict:
-    """Generate labels for each cluster and write cluster_label to all samples.
+    """Generate per-cluster descriptions via Pegasus and write two sample fields.
 
-    Returns dict {cluster_id: label_str}.
+    For each (non-noise) cluster we sample up to ``PEGASUS_REPS_TOTAL`` diverse
+    representatives (see ``find_cluster_representatives``), send each one to
+    Pegasus with a labeled prompt, and aggregate the results into:
+
+    * ``cluster_label`` — joined COMMON descriptions (what the reps share)
+    * ``cluster_diversity`` — joined VARIATION notes (how they differ)
+
+    When ``use_pegasus`` is False, both fields fall back to ``"Cluster N"``
+    and an empty string so the downstream UI still has something to show.
+
+    Returns ``{cluster_id: label_str}`` for call-site compatibility; the
+    diversity mapping is written directly onto the samples.
     """
     representatives = find_cluster_representatives(dataset)
     cluster_labels = {}
+    cluster_diversity = {}
     n_clusters = len(representatives)
 
     if not use_pegasus:
-        # Fast path: generic labels
+        # Fast path: generic labels, no diversity info.
         for cid in sorted(representatives.keys()):
             cluster_labels[cid] = f"Cluster {cid}"
+            cluster_diversity[cid] = ""
     else:
         use_indexing = False
         index_id = None
@@ -457,44 +984,67 @@ def generate_cluster_labels(
             )
 
             samples = representatives[cid]
-            descriptions = []
+            commons = []
+            variations = []
 
             if use_indexing and index_id is None:
                 index_id = create_pegasus_index(client)
 
             for sample in samples:
-                desc, use_indexing_new = generate_description(
+                common, variation, use_indexing_new = generate_description(
                     client, sample.filepath, use_indexing, index_id
                 )
 
-                # Handle approach switch
+                # Approach-A → Approach-B switch: if the direct call failed
+                # with a non-rate-limit error, retry this sample via indexing.
                 if use_indexing_new and not use_indexing:
                     use_indexing = True
                     if index_id is None:
                         index_id = create_pegasus_index(client)
-                    desc, _ = generate_description(
+                    common, variation, _ = generate_description(
                         client, sample.filepath, use_indexing, index_id
                     )
 
-                if desc:
-                    descriptions.append(desc)
+                if common:
+                    commons.append(common)
+                if variation:
+                    variations.append(variation)
 
-            # Combine descriptions into label
-            if len(descriptions) >= 2:
-                cluster_labels[cid] = f"{descriptions[0]}; {descriptions[1]}"
-            elif len(descriptions) == 1:
-                cluster_labels[cid] = descriptions[0]
+            # Label = the common descriptions joined (first two get the
+            # most weight — they come from the two nearest-centroid reps).
+            if commons:
+                cluster_labels[cid] = "; ".join(commons[:PEGASUS_REPS_NEAREST]) or commons[0]
             else:
                 cluster_labels[cid] = f"Cluster {cid}"
 
-    # Apply labels to all samples
+            # Diversity note = the variation phrases from every rep that
+            # produced one, deduplicated while preserving order.
+            seen = set()
+            deduped = []
+            for v in variations:
+                key = v.lower()
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(v)
+            cluster_diversity[cid] = "; ".join(deduped)
+
+    # Apply both fields to every sample. HDBSCAN noise (cid=-1) never got
+    # descriptions above, so tag with a clear marker and an empty diversity.
+    NOISE_LABEL = "Outliers (HDBSCAN noise)"
     for sample in dataset:
         try:
             cid = sample["cluster_id"]
         except (KeyError, AttributeError):
             continue
-        if cid is not None and cid in cluster_labels:
+        if cid is None:
+            continue
+        if cid == -1:
+            sample["cluster_label"] = NOISE_LABEL
+            sample["cluster_diversity"] = ""
+            sample.save()
+        elif cid in cluster_labels:
             sample["cluster_label"] = cluster_labels[cid]
+            sample["cluster_diversity"] = cluster_diversity.get(cid, "")
             sample.save()
 
     dataset.save()
@@ -556,14 +1106,22 @@ def extract_cluster_data(dataset: fo.Dataset) -> tuple:
 def compute_centroids(
     embeddings_norm: np.ndarray, cluster_ids: np.ndarray
 ) -> tuple:
-    """Recompute L2-normalized cluster centroids from sample embeddings."""
-    unique_ids = np.sort(np.unique(cluster_ids))
+    """Recompute L2-normalized cluster centroids from sample embeddings.
+
+    Noise samples (cluster_id = -1) are excluded — there is no meaningful
+    centroid for "everything that didn't cluster".
+    """
+    all_ids = np.unique(cluster_ids)
+    unique_ids = np.sort(all_ids[all_ids >= 0])
     centroids = []
 
     for cid in unique_ids:
         mask = cluster_ids == cid
         centroid = embeddings_norm[mask].mean(axis=0)
         centroids.append(centroid)
+
+    if not centroids:
+        return np.zeros((0, embeddings_norm.shape[1])), unique_ids
 
     centroids = np.array(centroids)
     centroids = normalize(centroids, norm="l2")
@@ -573,11 +1131,18 @@ def compute_centroids(
 def detect_sparse_clusters(
     cluster_ids: np.ndarray, cluster_labels_map: dict, threshold: int = SPARSE_THRESHOLD
 ) -> list:
-    """Flag clusters with fewer than threshold samples."""
+    """Flag clusters with fewer than threshold samples.
+
+    HDBSCAN noise (cluster_id = -1) is skipped — noise is already surfaced
+    via ``is_outlier`` and the "Outliers" cluster label; calling it "sparse"
+    on top of that would double-count.
+    """
     unique, counts = np.unique(cluster_ids, return_counts=True)
     sparse = []
 
     for cid, cnt in zip(unique, counts):
+        if cid == -1:
+            continue
         if cnt < threshold:
             sparse.append({
                 "cluster_id": int(cid),
@@ -618,109 +1183,409 @@ def detect_isolated_clusters(
     return isolated
 
 
+# ------------------------------------------------------------
+# Voronoi-based coverage helpers
+# ------------------------------------------------------------
+
+def _polygon_area(verts) -> float:
+    """Shoelace area of a polygon; orientation-agnostic via abs()."""
+    v = np.asarray(verts, dtype=float)
+    if v.ndim != 2 or v.shape[0] < 3:
+        return 0.0
+    x = v[:, 0]
+    y = v[:, 1]
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2.0)
+
+
+def _ensure_ccw(verts) -> np.ndarray:
+    """Return the polygon with counter-clockwise winding."""
+    v = np.asarray(verts, dtype=float)
+    signed = (v[:, 0] * np.roll(v[:, 1], -1) - v[:, 1] * np.roll(v[:, 0], -1)).sum() / 2.0
+    return v if signed > 0 else v[::-1]
+
+
+def _is_left_of_edge(p, a, b) -> bool:
+    """Left-of-edge test for a directed CCW edge a->b."""
+    return ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) >= 0.0
+
+
+def _line_segment_intersect(p1, p2, a, b):
+    """Intersect segment p1->p2 with the infinite line through a->b."""
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = a
+    x4, y4 = b
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-12:
+        return p1  # ~parallel — degenerate; caller rarely hits this path
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+    return (x1 - t * (x1 - x2), y1 - t * (y1 - y2))
+
+
+def _clip_polygon_convex(subject, clip_ccw) -> list:
+    """Sutherland-Hodgman: clip ``subject`` polygon against convex ``clip_ccw``."""
+    output = [tuple(p) for p in subject]
+    n = len(clip_ccw)
+    for i in range(n):
+        if not output:
+            break
+        a = tuple(clip_ccw[i])
+        b = tuple(clip_ccw[(i + 1) % n])
+        input_list = output
+        output = []
+        m = len(input_list)
+        for j in range(m):
+            p = input_list[j]
+            q = input_list[(j + 1) % m]
+            p_in = _is_left_of_edge(p, a, b)
+            q_in = _is_left_of_edge(q, a, b)
+            if p_in:
+                output.append(p)
+                if not q_in:
+                    output.append(_line_segment_intersect(p, q, a, b))
+            elif q_in:
+                output.append(_line_segment_intersect(p, q, a, b))
+    return output
+
+
 def compute_umap_coverage(
-    umap_coords: np.ndarray, grid_size: int = COVERAGE_GRID_SIZE
+    umap_coords: np.ndarray,
+    cell_threshold_factor: float = VORONOI_CELL_THRESHOLD_FACTOR,
 ) -> float:
-    """Compute what fraction of the UMAP bounding box is occupied."""
-    x_min, x_max = umap_coords[:, 0].min(), umap_coords[:, 0].max()
-    y_min, y_max = umap_coords[:, 1].min(), umap_coords[:, 1].max()
+    """Voronoi-based density coverage over the convex hull of UMAP points.
 
-    x_range = x_max - x_min
-    y_range = y_max - y_min
+    Each point's Voronoi cell (clipped to the hull) is small when the point
+    sits in a dense region and large when it's isolated. The coverage score
+    is the fraction of the convex hull's area occupied by cells whose area
+    is *below* ``median_area × cell_threshold_factor`` — i.e. the
+    well-covered, high-density share of the data envelope.
 
-    if x_range == 0 or y_range == 0:
+    Returns 0.0 for degenerate inputs (fewer than 4 points, collinear
+    points, or any Qhull failure).
+    """
+    coords = np.asarray(umap_coords, dtype=float)
+    n = coords.shape[0]
+    if n < 4:
         return 0.0
 
-    x_min -= 0.01 * x_range
-    x_max += 0.01 * x_range
-    y_min -= 0.01 * y_range
-    y_max += 0.01 * y_range
+    try:
+        hull = ConvexHull(coords)
+    except QhullError as e:
+        logger.warning("ConvexHull failed (%s); coverage = 0", e)
+        return 0.0
 
-    cell_w = (x_max - x_min) / grid_size
-    cell_h = (y_max - y_min) / grid_size
+    hull_verts_ccw = _ensure_ccw(coords[hull.vertices])
+    hull_area = _polygon_area(hull_verts_ccw)
+    if hull_area <= 0.0:
+        return 0.0
 
-    occupied = set()
-    for x, y in umap_coords:
-        cx = min(int((x - x_min) / cell_w), grid_size - 1)
-        cy = min(int((y - y_min) / cell_h), grid_size - 1)
-        occupied.add((cx, cy))
+    # Pad with four far-away corner points so every ORIGINAL point's cell is
+    # bounded. Scipy's Voronoi marks boundary-point cells as unbounded (-1
+    # vertex index); padding sidesteps that without hand-reconstructing the
+    # open edges. The corner points themselves get cells we don't care about.
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+    span = max(x_max - x_min, y_max - y_min, 1.0)
+    pad = 10.0 * span
+    corners = np.array([
+        [x_min - pad, y_min - pad],
+        [x_min - pad, y_max + pad],
+        [x_max + pad, y_min - pad],
+        [x_max + pad, y_max + pad],
+    ])
+    padded = np.vstack([coords, corners])
 
-    return len(occupied) / (grid_size * grid_size)
+    try:
+        vor = Voronoi(padded)
+    except QhullError as e:
+        logger.warning("Voronoi failed (%s); coverage = 0", e)
+        return 0.0
+
+    cell_areas = []
+    for i in range(n):
+        region_idx = vor.point_region[i]
+        region = vor.regions[region_idx]
+        if not region or -1 in region:
+            # Padding should prevent this, but stay safe.
+            continue
+        cell = vor.vertices[region]
+        clipped = _clip_polygon_convex(cell, hull_verts_ccw)
+        area = _polygon_area(clipped)
+        if area > 0.0:
+            cell_areas.append(area)
+
+    if not cell_areas:
+        return 0.0
+
+    cell_areas_arr = np.array(cell_areas)
+    threshold = float(np.median(cell_areas_arr)) * cell_threshold_factor
+    dense_area = float(cell_areas_arr[cell_areas_arr < threshold].sum())
+
+    return float(dense_area / hull_area)
+
+
+def _clip01(x: float) -> float:
+    """Clamp a float into [0.0, 1.0]."""
+    return max(0.0, min(1.0, float(x)))
+
+
+def score_gap_priority(
+    centroid_distance: float,
+    is_user_expected: bool,
+    isolation: float,
+    weights: Optional[tuple] = None,
+) -> float:
+    """Return a 0-100 priority score combining three factors.
+
+    - ``centroid_distance`` (cosine): how far the gap sits from the nearest
+      existing cluster. Larger = further from any data we have.
+    - ``is_user_expected``: True if this gap corresponds to a category the
+      user listed in ``expected_categories`` — a hard yes/no boost for
+      user-defined importance.
+    - ``isolation`` (cosine): distance between the nearest cluster and its
+      own nearest peer cluster. Gaps near an already-sparse region are
+      harder to fill, so they should surface higher.
+
+    Weights default to the ``GAP_PRIORITY_WEIGHT_*`` module constants but
+    callers can pass an explicit ``(w_distance, w_expected, w_isolation)``
+    triple. Weights are linearly normalized, so any proportional triple
+    works.
+    """
+    if weights is None:
+        weights = (
+            GAP_PRIORITY_WEIGHT_DISTANCE,
+            GAP_PRIORITY_WEIGHT_EXPECTED,
+            GAP_PRIORITY_WEIGHT_ISOLATION,
+        )
+    w_d, w_e, w_i = weights
+    w_sum = w_d + w_e + w_i
+    if w_sum <= 0:
+        return 0.0
+    raw = (
+        w_d * _clip01(centroid_distance)
+        + w_e * (1.0 if is_user_expected else 0.0)
+        + w_i * _clip01(isolation)
+    ) / w_sum
+    return round(100.0 * raw, 2)
+
+
+def compute_cluster_isolation(
+    centroids: np.ndarray, unique_ids: np.ndarray
+) -> dict:
+    """Per-cluster cosine distance to the nearest other cluster centroid.
+
+    Returns ``{cluster_id: float}`` keyed on non-noise cluster IDs. With
+    fewer than two clusters there are no "others" to measure against, so
+    every entry is 0.0.
+    """
+    isolation_map = {int(cid): 0.0 for cid in unique_ids}
+    n = len(unique_ids)
+    if n < 2:
+        return isolation_map
+
+    dist_matrix = cosine_distances(centroids, centroids)
+    np.fill_diagonal(dist_matrix, np.inf)  # exclude self from the nearest lookup
+    for i, cid in enumerate(unique_ids):
+        isolation_map[int(cid)] = float(dist_matrix[i].min())
+    return isolation_map
+
+
+def parse_category_hierarchy(text: str) -> list:
+    """Parse the hierarchical ``expected_categories`` input string.
+
+    Format: ``"parent1: child1, child2 | parent2: child3, child4"``.
+    Pipes separate top-level groups; a colon inside a group splits parent
+    from its comma-separated children. A group without a colon is treated
+    as a parent whose single leaf *is itself* — which makes the flat legacy
+    format (``"a, b, c"``, treated as three groups separated by pipes if
+    present, else one parent with children ``a, b, c``) still work.
+
+    Returns a list of ``(parent, [child, ...])`` tuples with at least one
+    child per parent. Empty / whitespace-only pieces are dropped.
+    """
+    if not text or not text.strip():
+        return []
+
+    # Split on pipe first; if there are no pipes AND no colons, the legacy
+    # flat form ``"a, b, c"`` is a single group of comma-separated leaves.
+    # We surface each as its own parent so callers treating every leaf as
+    # a top-level category keep working.
+    if "|" not in text and ":" not in text:
+        leaves = [p.strip() for p in text.split(",") if p.strip()]
+        return [(leaf, [leaf]) for leaf in leaves]
+
+    groups = [g.strip() for g in text.split("|") if g.strip()]
+    hierarchy = []
+    for g in groups:
+        if ":" in g:
+            parent_str, children_str = g.split(":", 1)
+            parent = parent_str.strip()
+            children = [c.strip() for c in children_str.split(",") if c.strip()]
+        else:
+            parent = g.strip()
+            children = []
+        if not parent:
+            continue
+        if not children:
+            # No explicit children — parent is its own leaf.
+            children = [parent]
+        hierarchy.append((parent, children))
+    return hierarchy
 
 
 def embed_categories(client: TwelveLabs, categories: list) -> dict:
-    """Embed category strings via Twelve Labs Marengo text API.
+    """Embed category strings via Twelve Labs Marengo text API, with retries.
+
+    Each category goes through ``_retry_sync`` so rate limits and transient
+    errors are handled uniformly with the rest of the pipeline. Categories
+    that still fail after retries are logged and skipped — the rest of the
+    dict is populated as normal.
 
     Returns dict {category_str: np.ndarray(512,)} for successful embeddings.
     """
-    results = {}
+    results: dict = {}
 
-    for i, category in enumerate(categories, start=1):
-        for attempt in range(2):
-            try:
-                response = client.embed.v_2.create(
-                    input_type="text",
-                    model_name="marengo3.0",
-                    text=TextInputRequest(input_text=category),
-                )
+    for category in categories:
+        def _embed_one(cat=category):
+            return client.embed.v_2.create(
+                input_type="text",
+                model_name="marengo3.0",
+                text=TextInputRequest(input_text=cat),
+            )
+        try:
+            response = _retry_sync(
+                _embed_one,
+                operation=f"Marengo text embed ({category!r})",
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to embed category '%s' after retries: %s", category, e
+            )
+            continue
 
-                embedding = np.array(response.data[0].embedding)
-                embedding = normalize(embedding.reshape(1, -1), norm="l2")[0]
-                results[category] = embedding
-                break
-
-            except Exception as e:
-                error_str = str(e).lower()
-
-                if "429" in str(e) or "rate" in error_str or "too many" in error_str:
-                    if attempt == 0:
-                        logger.info("Rate limited on category embed, waiting %ds...", RATE_LIMIT_WAIT)
-                        time.sleep(RATE_LIMIT_WAIT)
-                        continue
-
-                logger.warning("Failed to embed category '%s': %s", category, e)
-                break
+        embedding = np.array(response.data[0].embedding)
+        embedding = normalize(embedding.reshape(1, -1), norm="l2")[0]
+        results[category] = embedding
 
     return results
 
 
 def detect_category_gaps(
+    hierarchy: list,
     category_embeddings: dict,
-    embeddings_norm: np.ndarray,
-    cluster_ids: np.ndarray,
+    centroids: np.ndarray,
     unique_ids: np.ndarray,
     cluster_labels_map: dict,
+    cluster_umap_centers: dict,
+    cluster_isolation_map: dict,
     threshold: float = GAP_SIMILARITY_THRESHOLD,
-    umap_coords: Optional[np.ndarray] = None,
-) -> list:
-    """Compare each category embedding to all sample embeddings."""
-    categories = list(category_embeddings.keys())
-    cat_matrix = np.array([category_embeddings[c] for c in categories])
+    category_umap_coords: Optional[dict] = None,
+) -> tuple:
+    """Match each leaf category against cluster centroids (not sample points).
 
-    sim_matrix = cosine_similarity(cat_matrix, embeddings_norm)
+    Matching against centroids is the Phase 3.1 design: comparing text against
+    per-cluster means is a stabler signal than against individual samples,
+    and it makes parent-level aggregation sensible.
 
-    results = []
-    for i, category in enumerate(categories):
-        max_sim = float(sim_matrix[i].max())
-        closest_sample_idx = int(sim_matrix[i].argmax())
-        closest_cid = int(cluster_ids[closest_sample_idx])
-        closest_label = cluster_labels_map.get(closest_cid, f"Cluster {closest_cid}")
+    Args:
+        hierarchy: [(parent, [child, ...]), ...] from parse_category_hierarchy
+        category_embeddings: {leaf_str: np.ndarray(D,)} from embed_categories
+        centroids: (K, D) L2-normalized cluster centroids (no -1 / noise)
+        unique_ids: (K,) cluster IDs matching ``centroids`` row order
+        cluster_labels_map: {cid -> human label}
+        cluster_umap_centers: {cid -> (mean_umap_x, mean_umap_y)} — fallback
+            when no UMAP-projected category coord is available (places the
+            "Missing" marker near the nearest cluster).
+        category_umap_coords: optional {leaf_str -> (x, y)} from
+            ``umap.transform(text_embedding)`` (Phase 5.2). When present,
+            each gap marker sits at the projected category position in
+            embedding space — which naturally falls in a sparse zone of
+            the heatmap. Missing leaves fall back to the cluster center.
+        threshold: cosine-similarity floor below which a child is a gap
 
-        result = {
-            "category": category,
-            "closest_cluster": closest_label,
-            "closest_cluster_id": closest_cid,
-            "similarity": round(max_sim, 4),
-            "is_gap": max_sim < threshold,
+    Returns (hierarchy_report, flat_gaps).
+    """
+    if len(centroids) == 0 or not category_embeddings:
+        return [], []
+
+    category_umap_coords = category_umap_coords or {}
+
+    # Pre-compute sim(leaf, centroid) for every embedded leaf in one shot.
+    leaves = list(category_embeddings.keys())
+    leaf_matrix = np.array([category_embeddings[leaf] for leaf in leaves])
+    sim_matrix = cosine_similarity(leaf_matrix, centroids)  # (L, K)
+
+    leaf_to_row = {leaf: idx for idx, leaf in enumerate(leaves)}
+
+    def _child_record(leaf: str) -> Optional[dict]:
+        row = leaf_to_row.get(leaf)
+        if row is None:
+            return None
+        sims = sim_matrix[row]
+        best_col = int(sims.argmax())
+        best_cid = int(unique_ids[best_col])
+        best_sim = float(sims[best_col])
+        # Prefer the UMAP-projected position for the category itself —
+        # that puts the marker in the actual sparse zone of the heatmap.
+        # Fall back to the nearest cluster's UMAP center when no transform
+        # is available (e.g. n_samples < 3).
+        umap_xy = category_umap_coords.get(
+            leaf, cluster_umap_centers.get(best_cid, (0.0, 0.0))
+        )
+        is_gap = best_sim < threshold
+        record = {
+            "category": leaf,
+            "similarity": round(best_sim, 4),
+            "closest_cluster": cluster_labels_map.get(best_cid, f"Cluster {best_cid}"),
+            "closest_cluster_id": best_cid,
+            "is_gap": is_gap,
+            "umap_x": float(umap_xy[0]),
+            "umap_y": float(umap_xy[1]),
         }
+        # Priority score — only meaningful for entries that actually are gaps.
+        # Every leaf here came from the user's expected_categories input, so
+        # the "is_user_expected" factor is always True.
+        if is_gap:
+            centroid_distance = _clip01(1.0 - best_sim)
+            isolation = cluster_isolation_map.get(best_cid, 0.0)
+            record["priority_score"] = score_gap_priority(
+                centroid_distance=centroid_distance,
+                is_user_expected=True,
+                isolation=isolation,
+            )
+        return record
 
-        if umap_coords is not None:
-            result["umap_x"] = float(umap_coords[closest_sample_idx, 0])
-            result["umap_y"] = float(umap_coords[closest_sample_idx, 1])
+    hierarchy_report = []
+    flat_gaps = []
+    for parent, children in hierarchy:
+        child_records = []
+        for child in children:
+            rec = _child_record(child)
+            if rec is None:
+                # Embedding failed for this leaf — skip silently; it'll show
+                # up as missing from the report rather than crashing the run.
+                continue
+            child_records.append(rec)
 
-        results.append(result)
+        if not child_records:
+            continue
 
-    return results
+        n_total = len(child_records)
+        n_covered = sum(1 for r in child_records if not r["is_gap"])
+        best_sim = max(r["similarity"] for r in child_records)
+
+        hierarchy_report.append({
+            "parent": parent,
+            "n_children": n_total,
+            "n_covered": n_covered,
+            "coverage": round(n_covered / n_total, 4) if n_total else 0.0,
+            "best_similarity": round(best_sim, 4),
+            "children": child_records,
+        })
+
+        flat_gaps.extend(r for r in child_records if r["is_gap"])
+
+    return hierarchy_report, flat_gaps
 
 
 def tag_sparse_samples(dataset: fo.Dataset, sparse_cluster_ids: set) -> int:
@@ -745,10 +1610,22 @@ def detect_gaps(
     expected_categories: list,
     ctx,
     gap_threshold: float = GAP_SIMILARITY_THRESHOLD,
+    umap_reducer=None,
 ) -> dict:
-    """Run full gap detection (structural + category-driven).
+    """Run full gap detection (structural + hierarchical category-driven).
 
-    Returns gap_report dict.
+    ``expected_categories`` here is the parsed hierarchy
+    ``[(parent, [child, ...]), ...]`` — parsing happens upstream in the
+    operator so the caller can log or surface what it interpreted.
+
+    ``umap_reducer`` is the fitted ``umap.UMAP`` from stage 2. When
+    provided, every successfully embedded leaf is projected via
+    ``reducer.transform`` into the same 2-D space the scatter plot uses;
+    gap markers then land in the *actual* sparse zones of the heatmap
+    rather than being snapped to the nearest cluster's mean.
+
+    Returns gap_report dict with both a flat ``category_gaps`` list (for
+    Panel compatibility) and a nested ``category_hierarchy`` breakdown.
     """
     ctx.set_progress(progress=0.75, label="Extracting cluster data...")
 
@@ -758,30 +1635,99 @@ def detect_gaps(
     embeddings_norm = normalize(embeddings, norm="l2")
     centroids, unique_ids = compute_centroids(embeddings_norm, cluster_ids)
 
+    # UMAP mean per cluster — used to place the "Missing Categories" marker
+    # on the Panel near the closest cluster's visual center.
+    cluster_umap_centers = {}
+    for cid in unique_ids:
+        mask = cluster_ids == cid
+        if mask.any():
+            cluster_umap_centers[int(cid)] = (
+                float(umap_coords[mask, 0].mean()),
+                float(umap_coords[mask, 1].mean()),
+            )
+
+    # Per-cluster isolation — distance to the *nearest other* cluster.
+    # Feeds the isolation factor of score_gap_priority for both category
+    # gaps and sparse clusters.
+    cluster_isolation_map = compute_cluster_isolation(centroids, unique_ids)
+
     # Structural analysis
     ctx.set_progress(progress=0.80, label="Detecting sparse and isolated clusters...")
     sparse_clusters = detect_sparse_clusters(cluster_ids, cluster_labels_map)
     isolated_clusters = detect_isolated_clusters(centroids, unique_ids, cluster_labels_map)
     umap_coverage = compute_umap_coverage(umap_coords)
 
-    # Category-driven analysis
-    category_results = []
+    # Sparse clusters are "gaps" in the sense that a known region has too
+    # few samples. Their centroid-distance factor is 0 (they aren't distant
+    # from existing data — they ARE existing data, just thin), so their
+    # priority rides on isolation alone. Sparse clusters that also sit far
+    # from the rest of the dataset surface to the top.
+    for sc in sparse_clusters:
+        sc["priority_score"] = score_gap_priority(
+            centroid_distance=0.0,
+            is_user_expected=False,
+            isolation=cluster_isolation_map.get(sc["cluster_id"], 0.0),
+        )
+
+    # Category-driven analysis (hierarchical)
+    hierarchy_report = []
+    flat_gaps = []
     category_coverage = 0.0
+    total_leaves = 0
+    covered_leaves = 0
 
     if expected_categories:
-        ctx.set_progress(progress=0.85, label="Embedding expected categories...")
-        category_embeddings = embed_categories(client, expected_categories)
-
-        if category_embeddings:
-            ctx.set_progress(progress=0.90, label="Computing category gaps...")
-            category_results = detect_category_gaps(
-                category_embeddings, embeddings_norm, cluster_ids,
-                unique_ids, cluster_labels_map,
-                threshold=gap_threshold,
-                umap_coords=umap_coords,
+        # Flatten the hierarchy into the unique set of leaves we need to embed.
+        unique_leaves = list(dict.fromkeys(
+            child for _, children in expected_categories for child in children
+        ))
+        if unique_leaves:
+            ctx.set_progress(
+                progress=0.85,
+                label=f"Embedding {len(unique_leaves)} expected categories...",
             )
-            n_covered = sum(1 for cr in category_results if not cr["is_gap"])
-            category_coverage = n_covered / len(category_results)
+            category_embeddings = embed_categories(client, unique_leaves)
+
+            if category_embeddings and len(centroids) > 0:
+                # Project each leaf's text embedding into 2-D using the
+                # fitted UMAP from stage 2 — so markers for missing
+                # categories land in the true sparse zone of the heatmap
+                # rather than being snapped to their nearest cluster.
+                category_umap_coords = {}
+                if umap_reducer is not None and category_embeddings:
+                    try:
+                        names = list(category_embeddings.keys())
+                        matrix = np.array([category_embeddings[n] for n in names])
+                        projected = umap_reducer.transform(matrix)
+                        category_umap_coords = {
+                            n: (float(projected[i, 0]), float(projected[i, 1]))
+                            for i, n in enumerate(names)
+                        }
+                    except Exception as e:
+                        logger.warning(
+                            "UMAP.transform failed for category embeddings (%s); "
+                            "falling back to nearest-cluster centers for gap markers",
+                            e,
+                        )
+                        category_umap_coords = {}
+
+                ctx.set_progress(progress=0.90, label="Computing category gaps...")
+                hierarchy_report, flat_gaps = detect_category_gaps(
+                    expected_categories,
+                    category_embeddings,
+                    centroids,
+                    unique_ids,
+                    cluster_labels_map,
+                    cluster_umap_centers,
+                    cluster_isolation_map,
+                    threshold=gap_threshold,
+                    category_umap_coords=category_umap_coords,
+                )
+                for parent_entry in hierarchy_report:
+                    total_leaves += parent_entry["n_children"]
+                    covered_leaves += parent_entry["n_covered"]
+                if total_leaves:
+                    category_coverage = covered_leaves / total_leaves
 
     # Tag sparse samples
     ctx.set_progress(progress=0.95, label="Tagging sparse cluster samples...")
@@ -789,23 +1735,43 @@ def detect_gaps(
     tag_sparse_samples(dataset, sparse_ids)
 
     # Compute coverage score
-    if category_results:
+    if total_leaves:
         combined_score = 0.5 * umap_coverage + 0.5 * category_coverage
     else:
         combined_score = umap_coverage
 
+    # Surface highest-priority sparse clusters first so the report highlights
+    # the most isolated ones at the top.
+    sparse_clusters = sorted(
+        sparse_clusters,
+        key=lambda sc: sc.get("priority_score", 0.0),
+        reverse=True,
+    )
+
     gap_report = {
         "sparse_clusters": sparse_clusters,
-        "category_gaps": [
-            {
-                "category": cr["category"],
-                "closest_cluster": cr["closest_cluster"],
-                "similarity": cr["similarity"],
-                "umap_x": cr.get("umap_x", 0.0),
-                "umap_y": cr.get("umap_y", 0.0),
-            }
-            for cr in category_results if cr["is_gap"]
-        ],
+        # Flat list — one entry per missing leaf; preserves the Panel's
+        # "Missing Categories" trace shape from before 3.1. Sorted by
+        # priority_score descending so consumers that only take the top N
+        # see the most-important gaps first.
+        "category_gaps": sorted(
+            (
+                {
+                    "category": g["category"],
+                    "closest_cluster": g["closest_cluster"],
+                    "similarity": g["similarity"],
+                    "umap_x": g.get("umap_x", 0.0),
+                    "umap_y": g.get("umap_y", 0.0),
+                    "priority_score": g.get("priority_score", 0.0),
+                }
+                for g in flat_gaps
+            ),
+            key=lambda g: g["priority_score"],
+            reverse=True,
+        ),
+        # Hierarchical breakdown: each parent with its coverage fraction and
+        # per-child matches. Consumed by ShowGapReport and CoveragePanel.
+        "category_hierarchy": hierarchy_report,
         "coverage_score": round(float(combined_score), 4),
     }
 
@@ -837,32 +1803,51 @@ class AnalyzeCoverage(foo.Operator):
 
         inputs.int(
             "num_clusters",
-            label="Number of Clusters (0 = auto)",
+            label="Number of Clusters (0 = HDBSCAN auto)",
             description=(
-                "Number of clusters for grouping videos. "
-                "Set to 0 to auto-select using silhouette score."
+                "Leave at 0 (default) to use HDBSCAN: a density-based "
+                "algorithm that discovers clusters of varying sizes on its "
+                "own and flags low-density videos as outliers. Set to a "
+                "positive integer to fall back to KMeans with that exact "
+                "number of clusters — useful when you already know your "
+                "category count or want a fixed partition."
             ),
-            default=5,
+            default=0,
         )
 
         inputs.str(
             "expected_categories",
             label="Expected Categories",
             description=(
-                "Comma-separated list of expected video categories to check "
-                "against, e.g.: person falling, forklift moving, emergency evacuation"
+                "Hierarchical categories to check for coverage. Use a "
+                "pipe ('|') between top-level categories and a colon (':') "
+                "to list sub-categories under a parent, comma-separated. "
+                "Example: 'forklift operations: forward, reverse, loading, "
+                "turning | fall hazards: ladder climb, ladder descent, "
+                "elevated platform'. Each sub-category is embedded via "
+                "Marengo text and matched against cluster centroids, so "
+                "you get both parent-level coverage (how much of your "
+                "safety taxonomy you cover overall) and child-level gaps "
+                "(which specific variant is missing). A flat "
+                "comma-separated list still works and is treated as "
+                "top-level categories with no children."
             ),
             default="",
         )
 
         inputs.bool(
             "use_pegasus",
-            label="Generate Cluster Descriptions (Pegasus)",
+            label="Generate Cluster Descriptions Upfront (Pegasus)",
             description=(
-                "Generate natural language cluster descriptions using Pegasus. "
-                "If disabled, clusters get generic labels (faster)."
+                "When enabled, calls Pegasus on 4 representative videos per "
+                "cluster during the analysis — useful if you want all "
+                "descriptions ready in the exported report. Leave disabled "
+                "(the default) for fast runs: the Coverage Map panel "
+                "lazy-loads a description with one Pegasus call the first "
+                "time you click a cluster, and caches it for the rest of "
+                "the session."
             ),
-            default=True,
+            default=False,
         )
 
         inputs.int(
@@ -877,10 +1862,13 @@ class AnalyzeCoverage(foo.Operator):
 
         inputs.float(
             "outlier_threshold",
-            label="Outlier Threshold (std deviations)",
+            label="Outlier Threshold (KMeans only, std deviations)",
             description=(
-                "Samples with centroid distance > mean + N*std are flagged as "
-                "outliers. Lower values flag more outliers."
+                "Only applied when num_clusters > 0 (KMeans mode). Samples "
+                "whose cosine distance to their cluster centroid exceeds "
+                "mean + N*std are flagged as outliers. Lower values flag "
+                "more outliers. Ignored under HDBSCAN, which labels noise "
+                "natively."
             ),
             default=2.0,
         )
@@ -895,6 +1883,17 @@ class AnalyzeCoverage(foo.Operator):
             default=0.3,
         )
 
+        inputs.bool(
+            "clear_cache",
+            label="Clear Embedding Cache (force re-embed)",
+            description=(
+                "Wipe the persistent embedding cache and every sample's "
+                "embedding field before running, so every video gets a fresh "
+                "Marengo call. Leave off to reuse cached embeddings."
+            ),
+            default=False,
+        )
+
         return types.Property(
             inputs,
             view=types.View(label="Video Content Gap Analyzer"),
@@ -902,17 +1901,27 @@ class AnalyzeCoverage(foo.Operator):
 
     def execute(self, ctx):
         dataset = ctx.dataset
-        num_clusters = ctx.params.get("num_clusters", 5)
+        num_clusters = ctx.params.get("num_clusters", 0)
         expected_categories_str = ctx.params.get("expected_categories", "")
-        use_pegasus = ctx.params.get("use_pegasus", True)
+        use_pegasus = ctx.params.get("use_pegasus", False)
         max_samples = ctx.params.get("max_samples", 0)
-        outlier_threshold = ctx.params.get("outlier_threshold", 2.0)
+        # outlier_threshold is only consumed by the KMeans branch of
+        # run_clustering; HDBSCAN ignores it (noise label handles outliers).
+        outlier_threshold = ctx.params.get("outlier_threshold", OUTLIER_STD_FACTOR)
         gap_threshold = ctx.params.get("gap_threshold", 0.3)
+        clear_cache = ctx.params.get("clear_cache", False)
 
-        # Parse categories
-        expected_categories = [
-            c.strip() for c in expected_categories_str.split(",") if c.strip()
-        ] if expected_categories_str else []
+        # Parse the hierarchical categories string into
+        # [(parent, [child, ...]), ...]. Flat legacy inputs degrade to one
+        # entry per category with the category itself as its only leaf.
+        category_hierarchy = parse_category_hierarchy(expected_categories_str)
+        if category_hierarchy:
+            n_parents = len(category_hierarchy)
+            n_leaves = sum(len(children) for _, children in category_hierarchy)
+            logger.info(
+                "Expected categories: %d parent(s), %d leaf(-ves) total",
+                n_parents, n_leaves,
+            )
 
         # Edge case: empty dataset
         total = len(dataset)
@@ -954,25 +1963,81 @@ class AnalyzeCoverage(foo.Operator):
         except RuntimeError as e:
             return {"error": str(e)}
 
-        # Stage 1: Embeddings (0.00 - 0.25)
-        ctx.set_progress(progress=0.0, label="Stage 1/4: Generating video embeddings...")
-        success, fail, skip = embed_all_samples(client, dataset, ctx)
-        logger.info("Embeddings: %d new, %d failed, %d skipped", success, fail, skip)
-
-        if skip == total:
-            ctx.set_progress(
-                progress=0.25,
-                label=f"Using existing embeddings (all {skip} cached)",
+        # Optional: wipe both the persistent disk cache and every sample's
+        # embedding field so stage 1 hits the API for every video.
+        if clear_cache:
+            ctx.set_progress(progress=0.0, label="Clearing embedding cache...")
+            with EmbeddingCache() as _cache:
+                n_cleared = _cache.clear()
+            n_fields_wiped = 0
+            for _s in dataset:
+                try:
+                    if _s["embedding"] is not None:
+                        _s["embedding"] = None
+                        _s.save()
+                        n_fields_wiped += 1
+                except (KeyError, AttributeError):
+                    pass
+            logger.info(
+                "clear_cache: removed %d disk entries, wiped %d sample embeddings",
+                n_cleared, n_fields_wiped,
             )
 
-        # Stage 2: Clustering (0.25 - 0.50)
-        ctx.set_progress(progress=0.25, label="Stage 2/4: Clustering embeddings...")
-        n_samples, num_clusters = run_clustering(
-            dataset, num_clusters, outlier_std_factor=outlier_threshold
+        # Stage 1: Embeddings (0.00 - 0.25) — runs up to EMBED_CONCURRENCY
+        # Twelve Labs calls in parallel via the async SDK; cache lookups
+        # short-circuit the API. Permanent failures (after retries) are
+        # captured per-sample as embedding_error so users can filter.
+        ctx.set_progress(progress=0.0, label="Stage 1/4: Generating video embeddings...")
+        success, fail, skip, cache_hits, failure_reasons = embed_all_samples(
+            dataset, ctx
+        )
+        already_embedded = skip - cache_hits
+        logger.info(
+            "Embeddings: %d new, %d from disk cache, %d already embedded, %d failed",
+            success, cache_hits, already_embedded, fail,
+        )
+
+        # Post-stage-1 summary. When retries exhausted for any sample, call
+        # out the count + the top failure reason so it's obvious without
+        # scrolling through logs.
+        failure_tail = ""
+        if fail:
+            top_reason = max(failure_reasons.items(), key=lambda kv: kv[1])[0] \
+                if failure_reasons else "see logs"
+            failure_tail = (
+                f", {fail} skipped after retries "
+                f"(top reason: {top_reason[:60]}; filter by "
+                f"embedding_error field to inspect)"
+            )
+        ctx.set_progress(
+            progress=0.25,
+            label=(
+                f"Embeddings complete: {success} new, {cache_hits} from cache, "
+                f"{already_embedded} already embedded"
+                + failure_tail
+            ),
+        )
+
+        # Stage 2: Clustering (0.25 - 0.50). num_clusters == 0 (default) uses
+        # HDBSCAN and its native noise detection; a positive value falls back
+        # to KMeans with that exact k and the classic distance-based outlier
+        # heuristic parameterized by ``outlier_threshold``.
+        algorithm_label = "HDBSCAN" if num_clusters == 0 else f"KMeans (k={num_clusters})"
+        ctx.set_progress(
+            progress=0.25,
+            label=f"Stage 2/4: Clustering embeddings with {algorithm_label}...",
+        )
+        n_samples, num_clusters, n_noise, umap_reducer = run_clustering(
+            dataset,
+            n_clusters=num_clusters,
+            outlier_std_factor=outlier_threshold,
         )
         ctx.set_progress(
             progress=0.50,
-            label=f"Clustered {n_samples} samples into {num_clusters} groups",
+            label=(
+                f"Clustered {n_samples - n_noise} samples into {num_clusters} groups"
+                + (f" ({n_noise} outliers)" if n_noise else "")
+            ),
         )
 
         # Stage 3: Cluster descriptions (0.50 - 0.75)
@@ -982,12 +2047,22 @@ class AnalyzeCoverage(foo.Operator):
         # Stage 4: Gap detection (0.75 - 1.00)
         ctx.set_progress(progress=0.75, label="Stage 4/4: Detecting coverage gaps...")
         gap_report = detect_gaps(
-            client, dataset, expected_categories, ctx,
+            client, dataset, category_hierarchy, ctx,
             gap_threshold=gap_threshold,
+            umap_reducer=umap_reducer,
         )
 
         # Store report
         dataset.info["gap_report"] = gap_report
+
+        # Append a lightweight history entry so subsequent runs can compute
+        # a "since last run" diff. Each entry carries timestamp, coverage
+        # score, sample + cluster counts, and the list of active gap names —
+        # enough for the ShowGapReport / Export operators to tell the user
+        # what changed without re-running the whole analysis.
+        history = list(dataset.info.get(HISTORY_INFO_KEY, []) or [])
+        history.append(build_coverage_history_entry(gap_report, dataset))
+        dataset.info[HISTORY_INFO_KEY] = history
         dataset.save()
 
         ctx.set_progress(progress=1.0, label="Analysis complete!")
@@ -998,6 +2073,12 @@ class AnalyzeCoverage(foo.Operator):
             "n_category_gaps": len(gap_report["category_gaps"]),
             "n_samples": n_samples,
             "n_clusters": num_clusters,
+            "n_fresh_embeddings": success,
+            "n_from_cache": cache_hits,
+            "n_already_embedded": already_embedded,
+            "n_failed_embeddings": fail,
+            # {reason_str: count} — empty when the stage ran clean.
+            "embedding_failure_reasons": failure_reasons,
         }
 
     def resolve_output(self, ctx):
@@ -1010,6 +2091,10 @@ class AnalyzeCoverage(foo.Operator):
         outputs.int("n_category_gaps", label="Category Gaps Found")
         outputs.int("n_samples", label="Samples Analyzed")
         outputs.int("n_clusters", label="Clusters Created")
+        outputs.int("n_fresh_embeddings", label="Embeddings (fresh API calls)")
+        outputs.int("n_from_cache", label="Embeddings (loaded from cache)")
+        outputs.int("n_already_embedded", label="Embeddings (already on sample)")
+        outputs.int("n_failed_embeddings", label="Embedding Failures")
         return types.Property(
             outputs,
             view=types.View(label="Coverage Analysis Complete"),
@@ -1043,99 +2128,301 @@ class ShowGapReport(foo.Operator):
         gap_report = dataset.info.get("gap_report", None)
 
         if gap_report is None:
+            # resolve_output will detect this via the "_no_report" marker and
+            # render a single Error notice instead of the tiered views.
             return {
+                "_no_report": True,
                 "report": "**No gap report found.** Run 'Analyze Coverage' first.",
                 "coverage_score": 0.0,
                 "n_sparse": 0,
                 "n_gaps": 0,
             }
 
-        score = gap_report.get("coverage_score", 0.0)
-        sparse = gap_report.get("sparse_clusters", [])
-        gaps = gap_report.get("category_gaps", [])
+        # Compute the "since last run" diff from stored history. The
+        # AnalyzeCoverage operator appends a history entry after every run,
+        # so the *previous* run is the second-to-last entry. When no prior
+        # run exists, diff stays None and the tiered renderer omits the
+        # section entirely.
+        current_entry = build_coverage_history_entry(gap_report, dataset)
+        history = dataset.info.get(HISTORY_INFO_KEY, []) or []
+        previous_entry = history[-2] if len(history) >= 2 else None
+        diff = compute_coverage_diff(current_entry, previous_entry)
 
-        # Build markdown report
-        lines = []
-        lines.append(f"## Coverage Score: {score:.2f}")
-        lines.append("")
+        # Delegate the full three-tier rendering to gap_report so the same
+        # data is reusable outside the operator (notebooks, tests).
+        tiered = build_tiered_report(gap_report, dataset, diff=diff)
+        t1 = tiered["tier1_executive"]
+        t2 = tiered["tier2_priority_gaps"]
+        t3 = tiered["tier3_full_breakdown"]
 
-        # Sparse clusters
-        if sparse:
-            lines.append(f"### Sparse Clusters ({len(sparse)})")
-            for sc in sparse:
-                label = sc["label"]
-                if len(label) > 60:
-                    label = label[:60] + "..."
-                lines.append(
-                    f"- **Cluster {sc['cluster_id']}** "
-                    f"({sc['count']} samples): {label}"
-                )
-        else:
-            lines.append("### Sparse Clusters: None")
-        lines.append("")
+        # Priority gap rows, ranked + pre-formatted for TableView display.
+        priority_rows = [
+            {
+                "rank": i + 1,
+                "severity": entry["severity"],
+                "priority_score": f"{entry['priority_score']:.0f}/100",
+                "name": entry["name"],
+                "closest_cluster": entry["closest_cluster"],
+                "similarity": f"{entry['similarity']:.2f}",
+                "collection_recommendation": entry["collection_recommendation"],
+            }
+            for i, entry in enumerate(t2)
+        ]
 
-        # Category gaps
-        if gaps:
-            lines.append(f"### Category Gaps ({len(gaps)})")
-            for cg in gaps:
-                closest = cg["closest_cluster"]
-                if len(closest) > 50:
-                    closest = closest[:50] + "..."
-                lines.append(
-                    f"- **{cg['category']}** "
-                    f"(similarity: {cg['similarity']:.2f}, "
-                    f"nearest: {closest})"
-                )
-        else:
-            lines.append("### Category Gaps: None")
-        lines.append("")
+        # Per-cluster stats table. Status carries a coloured-dot emoji so
+        # the FO TableView row visually matches its counterpart in the
+        # scatter plot (both speak the 4-bucket health palette).
+        cluster_rows = [
+            {
+                "cluster_id": c["cluster_id"],
+                "size": c["size"],
+                "status": (
+                    f"{CLUSTER_STATUS_EMOJI.get(c['status'], '')} "
+                    f"{c['status']}"
+                ).strip(),
+                "mean_centroid_distance": f"{c['mean_centroid_distance']:.3f}",
+                "max_centroid_distance": f"{c['max_centroid_distance']:.3f}",
+                "cluster_label": c["cluster_label"] or "",
+                "cluster_diversity": c["cluster_diversity"] or "",
+            }
+            for c in t3["clusters"]
+        ]
 
-        # Cluster summary from dataset samples
-        cluster_summary = {}
-        for sample in dataset:
-            try:
-                cid = sample["cluster_id"]
-                label = sample["cluster_label"]
-            except (KeyError, AttributeError):
-                continue
-            if cid is not None:
-                if cid not in cluster_summary:
-                    cluster_summary[cid] = {
-                        "label": label or f"Cluster {cid}",
-                        "count": 0,
-                    }
-                cluster_summary[cid]["count"] += 1
+        # Well-covered categories — flip side of the priority list.
+        well_covered_rows = [
+            {
+                "parent": wc["parent"],
+                "category": wc["category"],
+                "similarity": f"{wc['similarity']:.2f}",
+                "closest_cluster": wc["closest_cluster"],
+            }
+            for wc in t3["well_covered_categories"]
+        ]
 
-        if cluster_summary:
-            lines.append(f"### Cluster Summary ({len(cluster_summary)} clusters)")
-            for cid in sorted(cluster_summary.keys()):
-                info = cluster_summary[cid]
-                label = info["label"]
-                if len(label) > 60:
-                    label = label[:60] + "..."
-                lines.append(
-                    f"- **Cluster {cid}** ({info['count']} samples): {label}"
-                )
-
-        report_md = "\n".join(lines)
+        # Pre-format a short, stand-alone diff string for resolve_output so
+        # the UI-side code only has to pick a severity, not reformat text.
+        diff_label = ""
+        diff_description = ""
+        if diff is not None:
+            delta_sign = "+" if diff["coverage_delta_pct"] >= 0 else ""
+            diff_label = (
+                f"Since last run ({diff['previous_timestamp']}): "
+                f"{diff['coverage_score_prev']*100:.0f}% → "
+                f"{diff['coverage_score_curr']*100:.0f}% "
+                f"({delta_sign}{diff['coverage_delta_pct']:.1f} pts), "
+                f"samples {diff['n_samples_prev']} → {diff['n_samples_curr']}"
+            )
+            parts = []
+            if diff["closed_gaps"]:
+                parts.append(f"Closed: {', '.join(diff['closed_gaps'])}")
+            if diff["still_open_gaps"]:
+                parts.append(f"Still open: {', '.join(diff['still_open_gaps'])}")
+            if diff["newly_opened_gaps"]:
+                parts.append(f"Newly opened: {', '.join(diff['newly_opened_gaps'])}")
+            if not parts:
+                parts.append("No gap changes.")
+            diff_description = " · ".join(parts)
 
         return {
-            "report": report_md,
-            "coverage_score": score,
-            "n_sparse": len(sparse),
-            "n_gaps": len(gaps),
+            "_no_report": False,
+            # Diff ("since last run") — optional, only non-empty when a
+            # previous run's history entry is available.
+            "has_diff": diff is not None,
+            "diff": diff,
+            "diff_label": diff_label,
+            "diff_description": diff_description,
+            "diff_trend": (
+                "up" if diff and diff["coverage_delta"] > 0
+                else "down" if diff and diff["coverage_delta"] < 0
+                else "flat"
+            ),
+            # Tier 1 fields
+            "coverage_pct": t1["coverage_pct"],
+            "coverage_quality": t1["coverage_quality"],
+            "coverage_label": f"Coverage: {t1['coverage_pct']:.1f}% — {t1['coverage_quality']}",
+            "recommendation": t1["recommendation"],
+            "total_videos": t1["total_videos"],
+            "total_clusters": t1["total_clusters"],
+            "n_gaps_total": t1["n_gaps_total"],
+            "n_category_gaps": t1["n_category_gaps"],
+            "n_sparse_clusters": t1["n_sparse_clusters"],
+            # Tier 2 / 3 tables
+            "priority_rows": priority_rows,
+            "cluster_rows": cluster_rows,
+            "well_covered_rows": well_covered_rows,
+            "n_outliers": t3["n_outliers"],
+            # Full markdown (for programmatic consumers, not rendered in panel)
+            "report": render_tiered_report_md(tiered),
+            # Legacy keys expected by existing callers
+            "coverage_score": t1["coverage_score"],
+            "n_sparse": t1["n_sparse_clusters"],
+            "n_gaps": t1["n_gaps_total"],
         }
 
     def resolve_output(self, ctx):
         outputs = types.Object()
-        outputs.str(
-            "report",
-            label="Gap Report",
-            view=types.MarkdownView(),
+        result = ctx.results or {}
+
+        # -------- no-report short-circuit --------
+        if result.get("_no_report") or not result.get("coverage_quality"):
+            outputs.view(
+                "no_report",
+                types.Error(
+                    label="No gap report available",
+                    description=(
+                        "Run the 'Analyze Coverage' operator on this dataset "
+                        "first to generate a report, then re-open 'Show Gap "
+                        "Report'."
+                    ),
+                ),
+            )
+            return types.Property(
+                outputs,
+                view=types.View(label="Gap Detection Report"),
+            )
+
+        # -------- Since last run (only rendered when history exists) --------
+        # Pinned above everything else so the user sees movement before the
+        # current-state headline. Severity tracks the coverage trend:
+        # Success when up, Warning when down, neutral Notice when flat.
+        if result.get("has_diff"):
+            trend = result.get("diff_trend", "flat")
+            diff_label = result.get("diff_label", "")
+            diff_desc = result.get("diff_description", "")
+            if trend == "up":
+                diff_cls = types.Success
+            elif trend == "down":
+                diff_cls = types.Warning
+            else:
+                diff_cls = types.Notice
+            outputs.view(
+                "since_last_run",
+                diff_cls(label=diff_label, description=diff_desc),
+            )
+
+        # -------- Tier 1 — Executive Summary --------
+        outputs.view(
+            "tier1_header",
+            types.Header(
+                label="Tier 1 — Executive Summary",
+                divider=True,
+            ),
         )
-        outputs.float("coverage_score", label="Coverage Score")
-        outputs.int("n_sparse", label="Sparse Clusters")
-        outputs.int("n_gaps", label="Category Gaps")
+
+        quality = result["coverage_quality"]
+        label = result.get("coverage_label", "")
+        desc = result.get("recommendation", "")
+        # Severity-coded notice — surface the coverage band visually so the
+        # user reads red / yellow / green before anything else.
+        if quality == "Poor":
+            notice_cls = types.Error
+        elif quality == "Fair":
+            notice_cls = types.Warning
+        else:  # Good or Excellent
+            notice_cls = types.Success
+        outputs.view(
+            "coverage_notice",
+            notice_cls(label=label, description=desc),
+        )
+
+        # Quick numeric stats rendered as labelled ints so the panel shows
+        # them in a clean vertical stack without markdown formatting quirks.
+        outputs.int("total_videos", label="Videos analyzed")
+        outputs.int("total_clusters", label="Clusters found")
+        outputs.int("n_gaps_total", label="Gaps detected (total)")
+        outputs.int("n_category_gaps", label="  ↳ Category gaps")
+        outputs.int("n_sparse_clusters", label="  ↳ Sparse clusters")
+
+        # -------- Tier 2 — Priority Gaps --------
+        outputs.view(
+            "tier2_header",
+            types.Header(
+                label="Tier 2 — Priority Gaps",
+                divider=True,
+            ),
+        )
+
+        if result.get("priority_rows"):
+            priority_table = types.TableView()
+            priority_table.add_column("rank", label="#")
+            priority_table.add_column("severity", label="Severity")
+            priority_table.add_column("priority_score", label="Priority")
+            priority_table.add_column("name", label="Gap")
+            priority_table.add_column("closest_cluster", label="Closest Cluster")
+            priority_table.add_column("similarity", label="Similarity")
+            priority_table.add_column(
+                "collection_recommendation", label="Recommended action"
+            )
+            outputs.list(
+                "priority_rows",
+                types.Object(),
+                view=priority_table,
+                label="Top gaps ranked by priority (Critical > 70, Moderate 40–70, Low < 40)",
+            )
+        else:
+            outputs.view(
+                "no_priority",
+                types.Success(
+                    label="No gaps detected",
+                    description=(
+                        "Either no expected categories were provided or the "
+                        "dataset already covers every requested category "
+                        "within the similarity threshold."
+                    ),
+                ),
+            )
+
+        # -------- Tier 3 — Full Breakdown --------
+        outputs.view(
+            "tier3_header",
+            types.Header(
+                label="Tier 3 — Full Breakdown",
+                divider=True,
+            ),
+        )
+
+        if result.get("cluster_rows"):
+            cluster_table = types.TableView()
+            cluster_table.add_column("cluster_id", label="Cluster")
+            cluster_table.add_column("size", label="Size")
+            cluster_table.add_column("status", label="Status")
+            cluster_table.add_column("mean_centroid_distance", label="Mean dist")
+            cluster_table.add_column("max_centroid_distance", label="Max dist")
+            cluster_table.add_column("cluster_label", label="Pegasus description")
+            cluster_table.add_column("cluster_diversity", label="Diversity note")
+            outputs.list(
+                "cluster_rows",
+                types.Object(),
+                view=cluster_table,
+                label="Per-cluster statistics",
+            )
+
+        if result.get("n_outliers"):
+            outputs.view(
+                "outliers_notice",
+                types.Notice(
+                    label=f"{result['n_outliers']} outlier videos (HDBSCAN noise)",
+                    description=(
+                        "Videos the clustering couldn't assign to any cluster. "
+                        "Filter by the 'is_outlier' sample field or "
+                        "'sparse_cluster' tag to inspect them."
+                    ),
+                ),
+            )
+
+        if result.get("well_covered_rows"):
+            wc_table = types.TableView()
+            wc_table.add_column("parent", label="Parent")
+            wc_table.add_column("category", label="Category")
+            wc_table.add_column("similarity", label="Similarity")
+            wc_table.add_column("closest_cluster", label="Nearest cluster")
+            outputs.list(
+                "well_covered_rows",
+                types.Object(),
+                view=wc_table,
+                label="Well-covered categories (no action needed)",
+            )
+
         return types.Property(
             outputs,
             view=types.View(label="Gap Detection Report"),
@@ -1143,8 +2430,190 @@ class ShowGapReport(foo.Operator):
 
 
 # ============================================================
+# Operator 3: ExportCoverageReport
+# ============================================================
+
+class ExportCoverageReport(foo.Operator):
+    """Write a self-contained HTML report to disk.
+
+    The HTML embeds the full three-tier text report, an inline SVG UMAP
+    scatter plot built from per-sample umap_x/umap_y fields, and a base64
+    data-URI download link for a per-cluster CSV. Recipients without
+    FiftyOne installed can open the file in any browser.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="export_coverage_report",
+            label="Export Coverage Report",
+            description=(
+                "Export the gap analysis as a single-file HTML report "
+                "(UMAP plot + three-tier report + downloadable CSV). "
+                "Run 'Analyze Coverage' first to populate the gap report."
+            ),
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str(
+            "output_path",
+            label="Output HTML path",
+            description=(
+                "Absolute or ~-relative path where the self-contained "
+                "HTML file will be written. A '.html' suffix is added if "
+                "missing. Parent directories are created. Existing files "
+                "at the target path are overwritten."
+            ),
+            default="~/coverage_report.html",
+            required=True,
+        )
+        return types.Property(
+            inputs,
+            view=types.View(label="Export Coverage Report"),
+        )
+
+    def execute(self, ctx):
+        dataset = ctx.dataset
+        gap_report = dataset.info.get("gap_report", None)
+        if gap_report is None:
+            return {
+                "error": (
+                    "No gap report found on the dataset. Run the "
+                    "'Analyze Coverage' operator before exporting."
+                ),
+            }
+
+        raw_path = (ctx.params.get("output_path") or "").strip()
+        if not raw_path:
+            return {"error": "Output path is required."}
+
+        # Be forgiving on the extension so the user doesn't get surprised.
+        if not raw_path.lower().endswith((".html", ".htm")):
+            raw_path += ".html"
+
+        try:
+            ctx.set_progress(progress=0.1, label="Rendering three-tier report...")
+            summary = export_coverage_report(dataset, gap_report, raw_path)
+            ctx.set_progress(progress=1.0, label="Export complete")
+        except Exception as e:
+            logger.exception("export_coverage_report failed")
+            return {"error": f"Export failed: {e}"}
+
+        return {
+            "output_path": summary["output_path"],
+            "file_size_bytes": summary["size_bytes"],
+            "n_samples": summary["n_samples"],
+            "n_clusters": summary["n_clusters"],
+        }
+
+    def resolve_output(self, ctx):
+        outputs = types.Object()
+        result = ctx.results or {}
+
+        if "error" in result:
+            outputs.view(
+                "export_error",
+                types.Error(
+                    label="Export failed",
+                    description=result["error"],
+                ),
+            )
+            return types.Property(outputs, view=types.View(label="Export result"))
+
+        path = result.get("output_path", "")
+        size = int(result.get("file_size_bytes", 0))
+        n_samples = int(result.get("n_samples", 0))
+        n_clusters = int(result.get("n_clusters", 0))
+
+        outputs.view(
+            "export_success",
+            types.Success(
+                label="Report exported",
+                description=(
+                    f"Wrote {size:,} bytes to {path}\n"
+                    f"({n_samples} samples plotted, {n_clusters} clusters in CSV). "
+                    "Open the file in any browser to view the report; no "
+                    "FiftyOne install required for recipients."
+                ),
+            ),
+        )
+        outputs.str("output_path", label="Output path")
+        outputs.int("file_size_bytes", label="File size (bytes)")
+        outputs.int("n_samples", label="Samples plotted")
+        outputs.int("n_clusters", label="Clusters in CSV")
+        return types.Property(outputs, view=types.View(label="Export result"))
+
+
+# ============================================================
 # Panel: CoveragePanel
 # ============================================================
+
+def _build_kde_heatmap_trace(umap_coords: np.ndarray) -> Optional[dict]:
+    """Emit a Plotly heatmap trace of the 2-D Gaussian KDE over ``umap_coords``.
+
+    The trace is intended as the *bottom* layer of the coverage panel's
+    scatter plot — warm colours mark dense regions, low-density areas fade
+    to transparent so the gaps jump out visually without needing to read
+    counts or sparsity tables.
+
+    Returns ``None`` when the input is too small or too degenerate for a
+    stable KDE (fewer than 4 points, all points on a line, or scipy flags
+    a singular covariance).
+    """
+    coords = np.asarray(umap_coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[0] < 4:
+        return None
+
+    x = coords[:, 0]
+    y = coords[:, 1]
+    if np.std(x) < 1e-9 or np.std(y) < 1e-9:
+        # Degenerate: all points collapsed to a line — KDE would go singular.
+        return None
+
+    try:
+        kde = gaussian_kde(np.vstack([x, y]))
+    except (np.linalg.LinAlgError, ValueError) as e:
+        logger.warning("KDE failed (%s); skipping heatmap layer", e)
+        return None
+
+    # 10% margin so the gradient decays off the outermost points instead of
+    # clipping at the hull boundary.
+    x_min, x_max = float(x.min()), float(x.max())
+    y_min, y_max = float(y.min()), float(y.max())
+    x_pad = 0.1 * (x_max - x_min) if x_max > x_min else 1.0
+    y_pad = 0.1 * (y_max - y_min) if y_max > y_min else 1.0
+
+    grid_x = np.linspace(x_min - x_pad, x_max + x_pad, KDE_GRID_SIZE)
+    grid_y = np.linspace(y_min - y_pad, y_max + y_pad, KDE_GRID_SIZE)
+    mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
+    density = kde(np.vstack([mesh_x.ravel(), mesh_y.ravel()])).reshape(
+        KDE_GRID_SIZE, KDE_GRID_SIZE
+    )
+
+    # Warm gradient: transparent at 0 → pale yellow → orange → red.
+    # The transparent stop at 0 means sparse regions render as empty space,
+    # which is the visual "gap" the user is looking for.
+    return {
+        "type": "heatmap",
+        "name": "Density",
+        "x": grid_x.tolist(),
+        "y": grid_y.tolist(),
+        "z": density.tolist(),
+        "colorscale": [
+            [0.00, "rgba(255, 255, 255, 0)"],
+            [0.10, "rgba(255, 247, 208, 0.25)"],
+            [0.35, "rgba(254, 217, 118, 0.55)"],
+            [0.60, "rgba(253, 141, 60, 0.75)"],
+            [0.85, "rgba(227, 74, 51, 0.88)"],
+            [1.00, "rgba(165, 15, 21, 0.95)"],
+        ],
+        "showscale": False,
+        "showlegend": False,
+        "hoverinfo": "skip",
+        "zsmooth": "best",
+    }
+
 
 class CoveragePanel(Panel):
     """Interactive visualization of video content gap analysis results."""
@@ -1179,8 +2648,20 @@ class CoveragePanel(Panel):
         ctx.panel.state.has_data = True
         score = gap_report.get("coverage_score", 0.0)
 
-        # Collect per-sample data grouped by cluster
+        # Lazy Pegasus cache — keyed by str(cluster_id). Populated on click
+        # below; persists for the lifetime of the panel so re-clicking the
+        # same cluster doesn't re-fire the API.
+        if not ctx.panel.get_state("cluster_description_cache"):
+            ctx.panel.state.cluster_description_cache = {}
+        # Track which cluster the render block should surface right now.
+        if ctx.panel.get_state("selected_cluster_id") is None:
+            ctx.panel.state.selected_cluster_id = None
+
+        # Collect per-sample data. HDBSCAN noise (cluster_id = -1) is split
+        # into a dedicated bucket so we can render it as visually distinct
+        # gray/hollow markers instead of another color in the cluster rotation.
         clusters = {}
+        noise_bucket = {"x": [], "y": [], "ids": [], "text": []}
         max_dist = 0.001
 
         for sample in dataset:
@@ -1195,12 +2676,23 @@ class CoveragePanel(Panel):
             if ux is None or uy is None or cid is None:
                 continue
 
+            fname = os.path.basename(sample.filepath)
+
+            if cid == -1:
+                noise_bucket["x"].append(ux)
+                noise_bucket["y"].append(uy)
+                noise_bucket["ids"].append(sample.id)
+                noise_bucket["text"].append(
+                    f"{fname}<br>Outlier (HDBSCAN noise)<br>"
+                    f"Nearest-centroid distance: {cdist:.3f}"
+                )
+                continue
+
             if cid not in clusters:
                 clusters[cid] = {
                     "label": clabel, "x": [], "y": [],
                     "ids": [], "text": [], "dists": [],
                 }
-            fname = os.path.basename(sample.filepath)
             clusters[cid]["x"].append(ux)
             clusters[cid]["y"].append(uy)
             clusters[cid]["ids"].append(sample.id)
@@ -1211,56 +2703,111 @@ class CoveragePanel(Panel):
             if cdist > max_dist:
                 max_dist = cdist
 
-        if not clusters:
+        if not clusters and not noise_bucket["x"]:
             ctx.panel.state.has_data = False
             return
 
-        # Build one Plotly trace per cluster
+        # Density heatmap goes in FIRST so it renders *beneath* the scatter
+        # points. Sparse regions fade to transparent — making gaps in the
+        # embedding space visually obvious at a glance, without having to
+        # read any counts.
+        all_xs = [x for c in clusters.values() for x in c["x"]] + list(noise_bucket["x"])
+        all_ys = [y for c in clusters.values() for y in c["y"]] + list(noise_bucket["y"])
+        umap_xy = np.array(list(zip(all_xs, all_ys))) if all_xs else np.zeros((0, 2))
+
         traces = []
+        heatmap_trace = _build_kde_heatmap_trace(umap_xy)
+        if heatmap_trace is not None:
+            traces.append(heatmap_trace)
         for cid in sorted(clusters.keys()):
             c = clusters[cid]
             sizes = [6 + 8 * (d / max_dist) for d in c["dists"]]
             label_short = (
                 c["label"][:30] + "..." if len(c["label"]) > 30 else c["label"]
             )
+            # Phase 5.4: cluster colour reflects health, not position in an
+            # auto-rotated palette. Green = well-covered (≥6), yellow = thin
+            # (3–5), red = sparse (<3). Legend name carries the same emoji
+            # so the plot legend and report tables speak the same language.
+            health = classify_cluster_health(len(c["x"]), cid)
+            color = CLUSTER_STATUS_COLORS[health]
+            emoji = CLUSTER_STATUS_EMOJI[health]
             traces.append({
                 "type": "scatter",
                 "mode": "markers",
-                "name": f"C{cid}: {label_short}",
+                "name": f"{emoji} C{cid} ({health}): {label_short}",
                 "x": c["x"],
                 "y": c["y"],
                 "ids": c["ids"],
-                "marker": {"size": sizes, "opacity": 0.75},
+                "marker": {
+                    "size": sizes,
+                    "opacity": 0.78,
+                    "color": color,
+                    "line": {"color": "#1f2937", "width": 0.4},
+                },
                 "text": c["text"],
                 "hovertemplate": "%{text}<extra></extra>",
             })
 
-        # Category gap markers (hollow red diamonds)
+        # Noise / outliers — hollow circles in the shared noise-gray so the
+        # plot legend and the 'noise' row in the report table match colour.
+        if noise_bucket["x"]:
+            noise_color = CLUSTER_STATUS_COLORS["noise"]
+            traces.append({
+                "type": "scatter",
+                "mode": "markers",
+                "name": f"{CLUSTER_STATUS_EMOJI['noise']} Outliers ({len(noise_bucket['x'])})",
+                "x": noise_bucket["x"],
+                "y": noise_bucket["y"],
+                "ids": noise_bucket["ids"],
+                "marker": {
+                    "size": 9,
+                    "color": "rgba(0,0,0,0)",
+                    "line": {"color": noise_color, "width": 1.5},
+                    "symbol": "circle-open",
+                },
+                "text": noise_bucket["text"],
+                "hovertemplate": "%{text}<extra></extra>",
+            })
+
+        # Category gap markers (hollow red diamonds with visible labels).
+        # Coords come from UMAP.transform on the category's text embedding
+        # (Phase 5.2), so the marker literally sits in the sparse region
+        # of the heatmap that the data is missing.
         category_gaps = gap_report.get("category_gaps", [])
         gaps_with_coords = [
             g for g in category_gaps
             if g.get("umap_x") is not None and g.get("umap_y") is not None
         ]
         if gaps_with_coords:
+            def _label(g):
+                name = g["category"]
+                return name if len(name) <= 22 else name[:22] + "…"
             traces.append({
                 "type": "scatter",
-                "mode": "markers",
+                "mode": "markers+text",
                 "name": "Missing Categories",
                 "x": [g["umap_x"] for g in gaps_with_coords],
                 "y": [g["umap_y"] for g in gaps_with_coords],
                 "marker": {
-                    "size": 16,
+                    "size": 18,
                     "color": "rgba(0,0,0,0)",
-                    "line": {"color": "red", "width": 2.5},
+                    "line": {"color": "#c62828", "width": 2.5},
                     "symbol": "diamond-open",
                 },
-                "text": [
+                # Visible label above each marker, coloured to match the
+                # diamond so the eye groups them together.
+                "text": [_label(g) for g in gaps_with_coords],
+                "textposition": "top center",
+                "textfont": {"size": 11, "color": "#c62828"},
+                # Hover tooltip retains the full context.
+                "hovertext": [
                     f"MISSING: {g['category']}<br>"
                     f"Similarity: {g['similarity']:.2f}<br>"
-                    f"Nearest: {g['closest_cluster'][:30]}"
+                    f"Nearest cluster: {g['closest_cluster'][:40]}"
                     for g in gaps_with_coords
                 ],
-                "hovertemplate": "%{text}<extra></extra>",
+                "hovertemplate": "%{hovertext}<extra></extra>",
             })
 
         layout = {
@@ -1277,10 +2824,13 @@ class CoveragePanel(Panel):
         ctx.panel.state.plot_layout = layout
 
         # Score markdown
+        n_clustered_samples = sum(len(c["x"]) for c in clusters.values())
+        n_noise = len(noise_bucket["x"])
+        noise_suffix = f" · **{n_noise} outliers**" if n_noise else ""
         ctx.panel.state.score_md = (
             f"# Dataset Coverage: {score:.0%}\n\n"
             f"**{len(clusters)} clusters** across "
-            f"**{sum(len(c['x']) for c in clusters.values())} samples**"
+            f"**{n_clustered_samples} samples**{noise_suffix}"
         )
 
         # Summary table
@@ -1298,8 +2848,43 @@ class CoveragePanel(Panel):
             label = c["label"][:50]
             status = "**Sparse**" if cid in sparse_ids else "OK"
             lines.append(f"| {cid} | {label} | {count} | {status} |")
+        if n_noise:
+            lines.append(
+                f"| — | Outliers (HDBSCAN noise) | {n_noise} | **Outlier** |"
+            )
 
-        if category_gaps:
+        hierarchy = gap_report.get("category_hierarchy", [])
+        if hierarchy:
+            lines += [
+                "", "### Category Coverage (hierarchical)", "",
+                "| Parent | Covered | Coverage | Best Sim |",
+                "|--------|---------|----------|----------|",
+            ]
+            for entry in hierarchy:
+                pct = entry["coverage"] * 100
+                lines.append(
+                    f"| {entry['parent'][:40]} "
+                    f"| {entry['n_covered']}/{entry['n_children']} "
+                    f"| {pct:.0f}% "
+                    f"| {entry['best_similarity']:.2f} |"
+                )
+            # Per-child detail table right below the parent summary
+            lines += [
+                "", "| Parent | Sub-category | Status | Similarity | Nearest |",
+                "|--------|--------------|--------|------------|---------|",
+            ]
+            for entry in hierarchy:
+                for child in entry["children"]:
+                    status = "**MISSING**" if child["is_gap"] else "OK"
+                    lines.append(
+                        f"| {entry['parent'][:25]} "
+                        f"| {child['category'][:25]} "
+                        f"| {status} "
+                        f"| {child['similarity']:.2f} "
+                        f"| {child['closest_cluster'][:25]} |"
+                    )
+        elif category_gaps:
+            # Legacy flat fallback
             lines += [
                 "", "### Missing Categories", "",
                 "| Category | Nearest Cluster | Similarity |",
@@ -1315,10 +2900,121 @@ class CoveragePanel(Panel):
         ctx.panel.state.summary_md = "\n".join(lines)
 
     def on_click_scatter(self, ctx):
-        """Select the clicked sample in the App grid."""
+        """Handle a scatter-plot click.
+
+        Two jobs in one handler: (1) select the clicked video in the App
+        grid (existing behaviour) and (2) lazy-load the clicked cluster's
+        Pegasus description on demand (Phase 5.3).
+
+        The description pass walks three fallbacks:
+
+          1. **Cache hit** — we've already fetched this cluster this session.
+             Nothing to do; render just picks it up from state.
+          2. **Upfront fields** — the user ran `AnalyzeCoverage` with
+             `use_pegasus=True`, so `cluster_label` / `cluster_diversity`
+             on the sample already carry real text. Copy them into the
+             cache so render uses the same path for both modes.
+          3. **Lazy fetch** — fire one Pegasus call on the cluster's
+             nearest-centroid rep, parse into (common, variation), cache
+             under str(cluster_id), and persist onto every sample in the
+             cluster so the next re-run of the panel starts warm.
+        """
         sample_id = ctx.params.get("id")
-        if sample_id:
-            ctx.ops.set_selected_samples([sample_id])
+        if not sample_id:
+            return
+
+        # Existing behaviour: jump to the clicked sample in the grid.
+        ctx.ops.set_selected_samples([sample_id])
+
+        try:
+            sample = ctx.dataset[sample_id]
+            cid_raw = sample["cluster_id"]
+        except (KeyError, AttributeError, Exception):
+            return
+        if cid_raw is None:
+            return
+
+        cid = int(cid_raw)
+        ctx.panel.state.selected_cluster_id = cid
+
+        # HDBSCAN noise — don't try to describe "stuff that didn't cluster".
+        # Mark it so the render block can show a clear message.
+        cache = dict(ctx.panel.get_state("cluster_description_cache", {}) or {})
+        key = str(cid)
+
+        if cid == -1:
+            cache[key] = {"noise": True}
+            ctx.panel.state.cluster_description_cache = cache
+            return
+
+        # 1. Cache hit — nothing to fetch.
+        if key in cache and not cache[key].get("error"):
+            return
+
+        # 2. Upfront-mode fields already on the sample.
+        try:
+            sample_label = sample.get_field("cluster_label") or ""
+            sample_diversity = sample.get_field("cluster_diversity") or ""
+        except Exception:
+            sample_label, sample_diversity = "", ""
+        generic_placeholder = f"Cluster {cid}"
+        is_generic = (
+            sample_label in ("", generic_placeholder, "Outliers (HDBSCAN noise)")
+        )
+        if not is_generic:
+            cache[key] = {
+                "common": sample_label,
+                "variation": sample_diversity,
+                "source": "upfront",
+            }
+            ctx.panel.state.cluster_description_cache = cache
+            return
+
+        # 3. Lazy fetch — one Pegasus call.
+        try:
+            client = get_twelvelabs_client()
+        except RuntimeError as e:
+            cache[key] = {"error": str(e), "source": "error"}
+            ctx.panel.state.cluster_description_cache = cache
+            return
+
+        try:
+            reps = find_cluster_representatives(ctx.dataset).get(cid, [])
+            if not reps:
+                cache[key] = {"error": "No samples in cluster.", "source": "error"}
+            else:
+                rep = reps[0]  # nearest-centroid sample — one API call
+                common, variation, _ = generate_description(
+                    client, rep.filepath, use_indexing=False, index_id=None
+                )
+                if not common and not variation:
+                    cache[key] = {
+                        "error": "Pegasus returned no content.",
+                        "source": "error",
+                    }
+                else:
+                    cache[key] = {
+                        "common": common,
+                        "variation": variation,
+                        "source": "lazy",
+                    }
+                    # Persist onto every sample in the cluster so next
+                    # session's panel boot starts warm and the exported
+                    # HTML report benefits from the discovered description.
+                    label_to_write = common or generic_placeholder
+                    for s in ctx.dataset:
+                        try:
+                            if int(s["cluster_id"]) == cid:
+                                s["cluster_label"] = label_to_write
+                                s["cluster_diversity"] = variation or ""
+                                s.save()
+                        except (KeyError, AttributeError, ValueError):
+                            continue
+        except Exception as e:
+            logger.warning("Lazy Pegasus call failed for cluster %d: %s", cid, e)
+            cache[key] = {"error": str(e), "source": "error"}
+
+        ctx.panel.state.cluster_description_cache = cache
 
     def render(self, ctx):
         panel = types.Object()
@@ -1354,6 +3050,41 @@ class CoveragePanel(Panel):
             name="summary_table",
         )
 
+        # Selected cluster description — populated lazily on scatter clicks
+        # by on_click_scatter(). Shows a hint when nothing's been clicked,
+        # an error if Pegasus failed, or the two-part description once it's
+        # cached. Same block serves both upfront and lazy modes.
+        selected_cid = ctx.panel.get_state("selected_cluster_id")
+        cache = ctx.panel.get_state("cluster_description_cache", {}) or {}
+        if selected_cid is None:
+            panel.md(
+                "_Click a point in the scatter plot to load a Pegasus "
+                "description for that cluster._",
+                name="cluster_desc_hint",
+            )
+        else:
+            key = str(int(selected_cid))
+            entry = cache.get(key)
+            desc_lines = [f"### Cluster C{selected_cid}"]
+            if entry is None:
+                desc_lines.append("_Loading description…_")
+            elif entry.get("noise"):
+                desc_lines.append(
+                    "_Outlier (HDBSCAN noise) — no cluster description available._"
+                )
+            elif entry.get("error"):
+                desc_lines.append(f"**Failed to load:** {entry['error']}")
+            else:
+                common = entry.get("common", "")
+                variation = entry.get("variation", "")
+                if common:
+                    desc_lines.append(f"**What it is:** {common}")
+                if variation:
+                    desc_lines.append(f"**How it varies:** {variation}")
+                source = entry.get("source", "unknown")
+                desc_lines.append(f"<sub>source: {source}</sub>")
+            panel.md("\n\n".join(desc_lines), name="cluster_desc")
+
         return types.Property(panel, view=types.View(label="Coverage Map"))
 
 
@@ -1364,4 +3095,5 @@ class CoveragePanel(Panel):
 def register(p):
     p.register(AnalyzeCoverage)
     p.register(ShowGapReport)
+    p.register(ExportCoverageReport)
     p.register(CoveragePanel)

@@ -3,4 +3,5 @@ huggingface_hub
 twelvelabs
 scikit-learn
 umap-learn
+hdbscan
 numpy
