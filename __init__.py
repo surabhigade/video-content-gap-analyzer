@@ -10,7 +10,9 @@ embeddings and Pegasus descriptions. Two operators:
 
 import os
 import time
+import asyncio
 import logging
+import threading
 from typing import Optional
 from datetime import datetime
 from collections import defaultdict
@@ -21,14 +23,22 @@ import fiftyone.operators as foo
 import fiftyone.operators.types as types
 from fiftyone.operators.panel import Panel, PanelConfig
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
 from sklearn.metrics.pairwise import cosine_distances, cosine_similarity
 from sklearn.preprocessing import normalize
+import hdbscan
 import umap
 
-from twelvelabs import TwelveLabs, VideoInputRequest, MediaSource, TextInputRequest
+from twelvelabs import (
+    TwelveLabs,
+    AsyncTwelveLabs,
+    VideoInputRequest,
+    MediaSource,
+    TextInputRequest,
+)
 from twelvelabs.types import VideoContext_AssetId
 from twelvelabs.indexes import IndexesCreateRequestModelsItem
+
+from .embedding_cache import EmbeddingCache
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +46,17 @@ logger = logging.getLogger(__name__)
 # Constants
 # ============================================================
 
-# Clustering
+# Clustering — HDBSCAN (default) parameters.
+# min_cluster_size matches SPARSE_THRESHOLD: any group smaller than this is
+# treated as noise by HDBSCAN anyway, so it's also our floor for "is this a
+# cluster at all?" Points HDBSCAN can't assign to any cluster are labeled -1
+# and surfaced as is_outlier=True on the sample.
+HDBSCAN_MIN_CLUSTER_SIZE = 3
+HDBSCAN_METRIC = "cosine"
+HDBSCAN_CLUSTER_SELECTION_METHOD = "eom"
+
+# KMeans fallback — used when the operator input num_clusters > 0. Keeps the
+# distance-threshold outlier heuristic the original pipeline relied on.
 KMEANS_N_INIT = 10
 KMEANS_RANDOM_STATE = 42
 OUTLIER_STD_FACTOR = 2.0
@@ -63,6 +83,11 @@ GAP_SIMILARITY_THRESHOLD = 0.30
 ISOLATION_STD_FACTOR = 1.5
 COVERAGE_GRID_SIZE = 10
 
+# Embedding concurrency — caps simultaneous Twelve Labs embed calls.
+# Matches Marengo's documented rate-limit headroom; raise only if you're
+# on a higher tier.
+EMBED_CONCURRENCY = 5
+
 
 # ============================================================
 # Helper functions — API setup
@@ -83,124 +108,182 @@ def get_twelvelabs_client() -> TwelveLabs:
 # Helper functions — Embedding (from notebook 01)
 # ============================================================
 
-def embed_sample(client: TwelveLabs, sample: fo.Sample) -> Optional[bool]:
-    """Embed a single video sample via Marengo 3.0.
+async def _embed_one_async(
+    client_async: AsyncTwelveLabs,
+    sample: fo.Sample,
+    cache: Optional[EmbeddingCache],
+    semaphore: asyncio.Semaphore,
+) -> str:
+    """Embed one sample via async Marengo. Returns a status string.
 
-    Returns True on success, False on failure, None if skipped.
+    Status values: "api" (newly embedded), "cache_hit" (disk cache hit),
+    "already_embedded" (field already set), "failed" (API error). The cache
+    and in-memory checks happen *outside* the semaphore so cached samples
+    don't consume concurrency slots.
     """
     filepath = sample.filepath
     filename = os.path.basename(filepath)
 
-    # Skip if already embedded
     try:
         if sample["embedding"] is not None:
-            return None
+            return "already_embedded"
     except (KeyError, AttributeError):
         pass
 
-    try:
-        with open(filepath, "rb") as f:
-            asset = client.assets.create(method="direct", file=f)
+    if cache is not None:
+        cached = cache.get(filepath)
+        if cached is not None:
+            sample["embedding"] = cached.tolist()
+            sample.save()
+            return "cache_hit"
 
-        response = client.embed.v_2.create(
-            input_type="video",
-            model_name="marengo3.0",
-            video=VideoInputRequest(
-                media_source=MediaSource(asset_id=asset.id),
-                embedding_option=["visual", "audio"],
-                embedding_scope=["asset"],
-                embedding_type=["fused_embedding"],
-            ),
+    async with semaphore:
+        try:
+            with open(filepath, "rb") as f:
+                asset = await client_async.assets.create(method="direct", file=f)
+
+            response = await client_async.embed.v_2.create(
+                input_type="video",
+                model_name="marengo3.0",
+                video=VideoInputRequest(
+                    media_source=MediaSource(asset_id=asset.id),
+                    embedding_option=["visual", "audio"],
+                    embedding_scope=["asset"],
+                    embedding_type=["fused_embedding"],
+                ),
+            )
+
+            embedding = response.data[0].embedding
+            sample["embedding"] = embedding
+            sample.save()
+
+            if cache is not None:
+                try:
+                    cache.put(filepath, embedding)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to cache embedding for %s: %s", filename, e
+                    )
+
+            return "api"
+
+        except Exception as e:
+            logger.warning("Failed to embed %s: %s", filename, e)
+            return "failed"
+
+
+async def _embed_all_async(dataset: fo.Dataset, ctx) -> tuple:
+    """Async orchestration for the embedding stage (0.00-0.25 of the run)."""
+    samples = list(dataset)
+    total = len(samples)
+    semaphore = asyncio.Semaphore(EMBED_CONCURRENCY)
+
+    counts = {"api": 0, "cache_hit": 0, "already_embedded": 0, "failed": 0}
+    completed = 0
+
+    api_key = os.environ.get("TWELVELABS_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "TWELVELABS_API_KEY environment variable is not set."
         )
 
-        embedding = response.data[0].embedding
-        sample["embedding"] = embedding
-        sample.save()
-        return True
+    async with AsyncTwelveLabs(api_key=api_key) as client_async:
+        with EmbeddingCache() as cache:
+            tasks = [
+                asyncio.create_task(
+                    _embed_one_async(client_async, s, cache, semaphore)
+                )
+                for s in samples
+            ]
 
-    except Exception as e:
-        logger.warning("Failed to embed %s: %s", filename, e)
-        return False
-
-
-def embed_all_samples(
-    client: TwelveLabs, dataset: fo.Dataset, ctx
-) -> tuple:
-    """Embed all samples in dataset, reporting progress in the 0.0-0.25 range.
-
-    Returns (success_count, fail_count, skip_count).
-    """
-    total = len(dataset)
-    success_count = 0
-    fail_count = 0
-    skip_count = 0
-
-    for i, sample in enumerate(dataset):
-        filename = os.path.basename(sample.filepath)
-
-        result = embed_sample(client, sample)
-        if result is None:
-            skip_count += 1
-            status = "cached"
-        elif result:
-            success_count += 1
-            status = "done"
-        else:
-            fail_count += 1
-            status = "failed"
-
-        ctx.set_progress(
-            progress=0.25 * ((i + 1) / max(total, 1)),
-            label=f"Embedding video {i + 1}/{total} ({status}): {filename}",
-        )
+            # Update progress on each completion so the bar advances even
+            # though tasks finish out of order. Using as_completed instead of
+            # a loop counter is what makes progress correct under concurrency.
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                counts[result] += 1
+                completed += 1
+                ctx.set_progress(
+                    progress=0.25 * (completed / max(total, 1)),
+                    label=(
+                        f"Embedding {completed}/{total} "
+                        f"({counts['api']} new, "
+                        f"{counts['cache_hit']} from cache, "
+                        f"{counts['already_embedded']} already embedded, "
+                        f"{counts['failed']} failed)"
+                    ),
+                )
 
     dataset.save()
-    return success_count, fail_count, skip_count
+    return (
+        counts["api"],
+        counts["failed"],
+        counts["cache_hit"] + counts["already_embedded"],
+        counts["cache_hit"],
+    )
+
+
+def embed_all_samples(dataset: fo.Dataset, ctx) -> tuple:
+    """Synchronous entry point used by AnalyzeCoverage.execute.
+
+    Wraps the async pipeline with ``asyncio.run`` unless we're already inside
+    a running event loop (some FiftyOne execution modes), in which case we
+    run it in a fresh thread with its own loop to avoid reentrancy errors.
+
+    Returns (api_count, failed_count, skipped_count, cache_hit_count).
+    ``skipped_count`` includes both in-memory skips (sample already had the
+    embedding field set) and disk-cache hits; ``cache_hit_count`` breaks
+    out the latter for logging.
+    """
+    try:
+        asyncio.get_running_loop()
+        in_running_loop = True
+    except RuntimeError:
+        in_running_loop = False
+
+    if not in_running_loop:
+        return asyncio.run(_embed_all_async(dataset, ctx))
+
+    result: dict = {}
+
+    def _runner() -> None:
+        try:
+            result["ok"] = asyncio.run(_embed_all_async(dataset, ctx))
+        except BaseException as e:
+            result["err"] = e
+
+    t = threading.Thread(target=_runner, name="embed-async-runner")
+    t.start()
+    t.join()
+
+    if "err" in result:
+        raise result["err"]
+    return result["ok"]
 
 
 # ============================================================
 # Helper functions — Clustering (from notebook 02)
 # ============================================================
 
-def find_optimal_k(embeddings_norm: np.ndarray, k_max: int = 10) -> int:
-    """Find the optimal number of clusters using silhouette score.
-
-    Tests k=2..min(k_max, n_samples-1) and returns the k with highest score.
-    Falls back to 2 if no valid k is found.
-    """
-    n_samples = len(embeddings_norm)
-    k_upper = min(k_max, n_samples - 1)
-
-    if k_upper < 2:
-        return 1
-
-    best_k = 2
-    best_score = -1.0
-
-    for k in range(2, k_upper + 1):
-        kmeans = KMeans(
-            n_clusters=k, random_state=KMEANS_RANDOM_STATE, n_init=KMEANS_N_INIT
-        )
-        labels = kmeans.fit_predict(embeddings_norm)
-        score = silhouette_score(embeddings_norm, labels, metric="cosine")
-        if score > best_score:
-            best_score = score
-            best_k = k
-
-    logger.info("Auto-selected k=%d (silhouette=%.3f)", best_k, best_score)
-    return best_k
-
 def run_clustering(
     dataset: fo.Dataset,
-    n_clusters: int,
+    n_clusters: int = 0,
     outlier_std_factor: float = OUTLIER_STD_FACTOR,
 ) -> tuple:
-    """Run KMeans clustering, outlier detection, and UMAP on embedded samples.
+    """Cluster the dataset's embeddings with HDBSCAN or KMeans, then UMAP.
 
-    Writes cluster_id, centroid_distance, is_outlier, umap_x, umap_y to each
-    sample. Returns the number of samples processed.
+    The ``n_clusters`` argument selects the algorithm:
+      * ``0`` (default) — HDBSCAN (density-based). Discovers clusters of
+        varying sizes, labels low-density points as noise (cluster_id=-1),
+        and writes ``cluster_confidence`` from its probabilities_ array.
+      * ``> 0`` — KMeans with that exact k. Every sample gets a cluster
+        (no noise label). Outliers are flagged by the classic heuristic
+        ``distance > mean + outlier_std_factor * std``; confidence is set
+        to 1.0 uniformly since KMeans has no native membership score.
+
+    Writes cluster_id, centroid_distance, is_outlier, cluster_confidence,
+    umap_x, umap_y to each sample. Returns (n_samples, n_clusters, n_noise).
     """
-    # Extract embedded samples
     samples_list = []
     embeddings_list = []
 
@@ -222,51 +305,108 @@ def run_clustering(
     embeddings = np.array(embeddings_list)
     embeddings_norm = normalize(embeddings, norm="l2")
 
-    # Auto-select k if requested (n_clusters == 0)
-    if n_clusters == 0:
-        n_clusters = find_optimal_k(embeddings_norm)
+    if n_clusters > 0:
+        # -------- KMeans fallback (explicit k from the user) --------
+        k = int(n_clusters)
+        if k > n_samples:
+            logger.warning(
+                "num_clusters (%d) > n_samples (%d), clamping", k, n_samples
+            )
+            k = max(1, n_samples - 1) if n_samples > 1 else 1
 
-    # Clamp n_clusters to valid range
-    if n_clusters > n_samples:
-        logger.warning(
-            "n_clusters (%d) > n_samples (%d), clamping", n_clusters, n_samples
-        )
-        n_clusters = max(1, n_samples - 1) if n_samples > 1 else 1
+        if k <= 1:
+            labels = np.zeros(n_samples, dtype=int)
+            centroids_norm = normalize(
+                embeddings_norm.mean(axis=0, keepdims=True), norm="l2"
+            )
+        else:
+            kmeans = KMeans(
+                n_clusters=k,
+                random_state=KMEANS_RANDOM_STATE,
+                n_init=KMEANS_N_INIT,
+            )
+            labels = kmeans.fit_predict(embeddings_norm)
+            centroids_norm = normalize(kmeans.cluster_centers_, norm="l2")
 
-    # KMeans
-    if n_clusters <= 1:
-        labels = np.zeros(n_samples, dtype=int)
-        centroids_norm = embeddings_norm.mean(axis=0, keepdims=True)
-        centroids_norm = normalize(centroids_norm, norm="l2")
+        distances = np.array([
+            cosine_distances(
+                embeddings_norm[i:i + 1],
+                centroids_norm[labels[i]:labels[i] + 1],
+            )[0, 0]
+            for i in range(n_samples)
+        ])
+
+        std_dist = distances.std()
+        if std_dist > 0:
+            threshold = distances.mean() + outlier_std_factor * std_dist
+            is_outlier = distances > threshold
+        else:
+            is_outlier = np.zeros(n_samples, dtype=bool)
+
+        # KMeans has no native membership score; 1.0 across the board signals
+        # "this algorithm doesn't distinguish confidence" without requiring
+        # downstream code to special-case a missing field.
+        probabilities = np.ones(n_samples, dtype=float)
     else:
-        kmeans = KMeans(
-            n_clusters=n_clusters, random_state=KMEANS_RANDOM_STATE,
-            n_init=KMEANS_N_INIT,
-        )
-        labels = kmeans.fit_predict(embeddings_norm)
-        centroids_norm = normalize(kmeans.cluster_centers_, norm="l2")
+        # -------- HDBSCAN default (density-based) --------
+        # HDBSCAN needs at least min_cluster_size samples to find anything;
+        # below that the library would raise. Short-circuit with a single
+        # trivial cluster and maximal confidence.
+        if n_samples < HDBSCAN_MIN_CLUSTER_SIZE:
+            labels = np.zeros(n_samples, dtype=int)
+            probabilities = np.ones(n_samples, dtype=float)
+        else:
+            # algorithm="generic" routes through sklearn.pairwise_distances,
+            # which is the only path that supports metric="cosine". The default
+            # BallTree backend rejects cosine outright.
+            clusterer = hdbscan.HDBSCAN(
+                min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+                metric=HDBSCAN_METRIC,
+                cluster_selection_method=HDBSCAN_CLUSTER_SELECTION_METHOD,
+                algorithm="generic",
+            )
+            labels = clusterer.fit_predict(embeddings_norm)
+            # probabilities_[i] is membership strength in [0, 1] for the
+            # assigned cluster; noise points get 0. Low-but-nonzero values
+            # mark samples sitting near a cluster boundary — a softer gap
+            # signal than -1.
+            probabilities = np.asarray(clusterer.probabilities_, dtype=float)
 
-    # Centroid distances
-    distances = np.array([
-        cosine_distances(
-            embeddings_norm[i:i + 1],
-            centroids_norm[labels[i]:labels[i] + 1],
-        )[0, 0]
-        for i in range(n_samples)
-    ])
+        unique_non_noise = np.sort(np.unique(labels[labels >= 0]))
 
-    mean_dist = distances.mean()
-    std_dist = distances.std()
+        # Mean centroid per non-noise cluster, L2-renormalized so cosine
+        # distance stays well-defined. Noise points get the distance to the
+        # *nearest* centroid — gives the Panel a meaningful "how far from any
+        # cluster" size.
+        distances = np.zeros(n_samples, dtype=float)
+        if len(unique_non_noise) > 0:
+            centroid_by_cid = {}
+            for cid in unique_non_noise:
+                mask = labels == cid
+                c = embeddings_norm[mask].mean(axis=0, keepdims=True)
+                centroid_by_cid[int(cid)] = normalize(c, norm="l2")[0]
 
-    # Outlier detection
-    if std_dist > 0:
-        threshold = mean_dist + outlier_std_factor * std_dist
-        is_outlier = distances > threshold
-    else:
-        is_outlier = np.zeros(n_samples, dtype=bool)
+            centroid_matrix = np.stack(list(centroid_by_cid.values()))
+            all_dists = cosine_distances(embeddings_norm, centroid_matrix)
 
-    # UMAP 2D reduction
-    if n_samples < 2:
+            cid_to_col = {cid: i for i, cid in enumerate(centroid_by_cid.keys())}
+            for i in range(n_samples):
+                if labels[i] >= 0:
+                    distances[i] = float(all_dists[i, cid_to_col[int(labels[i])]])
+                else:
+                    distances[i] = float(all_dists[i].min())
+
+        is_outlier = labels == -1
+
+    # Shared tail: recompute summary counts and run UMAP.
+    unique_non_noise = np.sort(np.unique(labels[labels >= 0]))
+    n_clusters = int(len(unique_non_noise))
+    n_noise = int(np.sum(labels == -1))
+
+    # UMAP 2D reduction. Needs n_neighbors >= 2 and at least 3 samples to
+    # form a meaningful manifold; below that we fall back to zero coords so
+    # downstream code that reads umap_x/umap_y still gets valid floats.
+    if n_samples < 3:
         coords_2d = np.zeros((n_samples, 2))
     else:
         n_neighbors = min(5, n_samples - 1)
@@ -279,17 +419,17 @@ def run_clustering(
         )
         coords_2d = reducer.fit_transform(embeddings_norm)
 
-    # Write fields to samples
     for i, sample in enumerate(samples_list):
         sample["cluster_id"] = int(labels[i])
         sample["centroid_distance"] = float(distances[i])
         sample["is_outlier"] = bool(is_outlier[i])
+        sample["cluster_confidence"] = float(probabilities[i])
         sample["umap_x"] = float(coords_2d[i, 0])
         sample["umap_y"] = float(coords_2d[i, 1])
         sample.save()
 
     dataset.save()
-    return n_samples, n_clusters
+    return n_samples, n_clusters, n_noise
 
 
 # ============================================================
@@ -306,7 +446,9 @@ def find_cluster_representatives(dataset: fo.Dataset) -> dict:
             dist = sample["centroid_distance"]
         except (KeyError, AttributeError):
             continue
-        if cid is not None and dist is not None:
+        # Skip HDBSCAN noise — describing "the stuff that didn't cluster" is
+        # never useful and would waste a Pegasus call on unrelated videos.
+        if cid is not None and cid != -1 and dist is not None:
             clusters[cid].append((dist, sample))
 
     representatives = {}
@@ -487,13 +629,21 @@ def generate_cluster_labels(
             else:
                 cluster_labels[cid] = f"Cluster {cid}"
 
-    # Apply labels to all samples
+    # Apply labels to all samples. HDBSCAN noise points (cid=-1) never get a
+    # description pass above, so tag them with a clear marker instead of
+    # leaving the field blank.
+    NOISE_LABEL = "Outliers (HDBSCAN noise)"
     for sample in dataset:
         try:
             cid = sample["cluster_id"]
         except (KeyError, AttributeError):
             continue
-        if cid is not None and cid in cluster_labels:
+        if cid is None:
+            continue
+        if cid == -1:
+            sample["cluster_label"] = NOISE_LABEL
+            sample.save()
+        elif cid in cluster_labels:
             sample["cluster_label"] = cluster_labels[cid]
             sample.save()
 
@@ -556,14 +706,22 @@ def extract_cluster_data(dataset: fo.Dataset) -> tuple:
 def compute_centroids(
     embeddings_norm: np.ndarray, cluster_ids: np.ndarray
 ) -> tuple:
-    """Recompute L2-normalized cluster centroids from sample embeddings."""
-    unique_ids = np.sort(np.unique(cluster_ids))
+    """Recompute L2-normalized cluster centroids from sample embeddings.
+
+    Noise samples (cluster_id = -1) are excluded — there is no meaningful
+    centroid for "everything that didn't cluster".
+    """
+    all_ids = np.unique(cluster_ids)
+    unique_ids = np.sort(all_ids[all_ids >= 0])
     centroids = []
 
     for cid in unique_ids:
         mask = cluster_ids == cid
         centroid = embeddings_norm[mask].mean(axis=0)
         centroids.append(centroid)
+
+    if not centroids:
+        return np.zeros((0, embeddings_norm.shape[1])), unique_ids
 
     centroids = np.array(centroids)
     centroids = normalize(centroids, norm="l2")
@@ -573,11 +731,18 @@ def compute_centroids(
 def detect_sparse_clusters(
     cluster_ids: np.ndarray, cluster_labels_map: dict, threshold: int = SPARSE_THRESHOLD
 ) -> list:
-    """Flag clusters with fewer than threshold samples."""
+    """Flag clusters with fewer than threshold samples.
+
+    HDBSCAN noise (cluster_id = -1) is skipped — noise is already surfaced
+    via ``is_outlier`` and the "Outliers" cluster label; calling it "sparse"
+    on top of that would double-count.
+    """
     unique, counts = np.unique(cluster_ids, return_counts=True)
     sparse = []
 
     for cid, cnt in zip(unique, counts):
+        if cid == -1:
+            continue
         if cnt < threshold:
             sparse.append({
                 "cluster_id": int(cid),
@@ -837,12 +1002,16 @@ class AnalyzeCoverage(foo.Operator):
 
         inputs.int(
             "num_clusters",
-            label="Number of Clusters (0 = auto)",
+            label="Number of Clusters (0 = HDBSCAN auto)",
             description=(
-                "Number of clusters for grouping videos. "
-                "Set to 0 to auto-select using silhouette score."
+                "Leave at 0 (default) to use HDBSCAN: a density-based "
+                "algorithm that discovers clusters of varying sizes on its "
+                "own and flags low-density videos as outliers. Set to a "
+                "positive integer to fall back to KMeans with that exact "
+                "number of clusters — useful when you already know your "
+                "category count or want a fixed partition."
             ),
-            default=5,
+            default=0,
         )
 
         inputs.str(
@@ -877,10 +1046,13 @@ class AnalyzeCoverage(foo.Operator):
 
         inputs.float(
             "outlier_threshold",
-            label="Outlier Threshold (std deviations)",
+            label="Outlier Threshold (KMeans only, std deviations)",
             description=(
-                "Samples with centroid distance > mean + N*std are flagged as "
-                "outliers. Lower values flag more outliers."
+                "Only applied when num_clusters > 0 (KMeans mode). Samples "
+                "whose cosine distance to their cluster centroid exceeds "
+                "mean + N*std are flagged as outliers. Lower values flag "
+                "more outliers. Ignored under HDBSCAN, which labels noise "
+                "natively."
             ),
             default=2.0,
         )
@@ -895,6 +1067,17 @@ class AnalyzeCoverage(foo.Operator):
             default=0.3,
         )
 
+        inputs.bool(
+            "clear_cache",
+            label="Clear Embedding Cache (force re-embed)",
+            description=(
+                "Wipe the persistent embedding cache and every sample's "
+                "embedding field before running, so every video gets a fresh "
+                "Marengo call. Leave off to reuse cached embeddings."
+            ),
+            default=False,
+        )
+
         return types.Property(
             inputs,
             view=types.View(label="Video Content Gap Analyzer"),
@@ -902,12 +1085,15 @@ class AnalyzeCoverage(foo.Operator):
 
     def execute(self, ctx):
         dataset = ctx.dataset
-        num_clusters = ctx.params.get("num_clusters", 5)
+        num_clusters = ctx.params.get("num_clusters", 0)
         expected_categories_str = ctx.params.get("expected_categories", "")
         use_pegasus = ctx.params.get("use_pegasus", True)
         max_samples = ctx.params.get("max_samples", 0)
-        outlier_threshold = ctx.params.get("outlier_threshold", 2.0)
+        # outlier_threshold is only consumed by the KMeans branch of
+        # run_clustering; HDBSCAN ignores it (noise label handles outliers).
+        outlier_threshold = ctx.params.get("outlier_threshold", OUTLIER_STD_FACTOR)
         gap_threshold = ctx.params.get("gap_threshold", 0.3)
+        clear_cache = ctx.params.get("clear_cache", False)
 
         # Parse categories
         expected_categories = [
@@ -954,25 +1140,68 @@ class AnalyzeCoverage(foo.Operator):
         except RuntimeError as e:
             return {"error": str(e)}
 
-        # Stage 1: Embeddings (0.00 - 0.25)
-        ctx.set_progress(progress=0.0, label="Stage 1/4: Generating video embeddings...")
-        success, fail, skip = embed_all_samples(client, dataset, ctx)
-        logger.info("Embeddings: %d new, %d failed, %d skipped", success, fail, skip)
-
-        if skip == total:
-            ctx.set_progress(
-                progress=0.25,
-                label=f"Using existing embeddings (all {skip} cached)",
+        # Optional: wipe both the persistent disk cache and every sample's
+        # embedding field so stage 1 hits the API for every video.
+        if clear_cache:
+            ctx.set_progress(progress=0.0, label="Clearing embedding cache...")
+            with EmbeddingCache() as _cache:
+                n_cleared = _cache.clear()
+            n_fields_wiped = 0
+            for _s in dataset:
+                try:
+                    if _s["embedding"] is not None:
+                        _s["embedding"] = None
+                        _s.save()
+                        n_fields_wiped += 1
+                except (KeyError, AttributeError):
+                    pass
+            logger.info(
+                "clear_cache: removed %d disk entries, wiped %d sample embeddings",
+                n_cleared, n_fields_wiped,
             )
 
-        # Stage 2: Clustering (0.25 - 0.50)
-        ctx.set_progress(progress=0.25, label="Stage 2/4: Clustering embeddings...")
-        n_samples, num_clusters = run_clustering(
-            dataset, num_clusters, outlier_std_factor=outlier_threshold
+        # Stage 1: Embeddings (0.00 - 0.25) — runs up to EMBED_CONCURRENCY
+        # Twelve Labs calls in parallel via the async SDK; cache lookups
+        # short-circuit the API.
+        ctx.set_progress(progress=0.0, label="Stage 1/4: Generating video embeddings...")
+        success, fail, skip, cache_hits = embed_all_samples(dataset, ctx)
+        already_embedded = skip - cache_hits
+        logger.info(
+            "Embeddings: %d new, %d from disk cache, %d already embedded, %d failed",
+            success, cache_hits, already_embedded, fail,
+        )
+
+        # Post-stage-1 summary so the cache benefit is visible even when
+        # not every sample was cached.
+        ctx.set_progress(
+            progress=0.25,
+            label=(
+                f"Embeddings complete: {success} new, {cache_hits} from cache, "
+                f"{already_embedded} already embedded"
+                + (f", {fail} failed" if fail else "")
+            ),
+        )
+
+        # Stage 2: Clustering (0.25 - 0.50). num_clusters == 0 (default) uses
+        # HDBSCAN and its native noise detection; a positive value falls back
+        # to KMeans with that exact k and the classic distance-based outlier
+        # heuristic parameterized by ``outlier_threshold``.
+        algorithm_label = "HDBSCAN" if num_clusters == 0 else f"KMeans (k={num_clusters})"
+        ctx.set_progress(
+            progress=0.25,
+            label=f"Stage 2/4: Clustering embeddings with {algorithm_label}...",
+        )
+        n_samples, num_clusters, n_noise = run_clustering(
+            dataset,
+            n_clusters=num_clusters,
+            outlier_std_factor=outlier_threshold,
         )
         ctx.set_progress(
             progress=0.50,
-            label=f"Clustered {n_samples} samples into {num_clusters} groups",
+            label=(
+                f"Clustered {n_samples - n_noise} samples into {num_clusters} groups"
+                + (f" ({n_noise} outliers)" if n_noise else "")
+            ),
         )
 
         # Stage 3: Cluster descriptions (0.50 - 0.75)
@@ -998,6 +1227,10 @@ class AnalyzeCoverage(foo.Operator):
             "n_category_gaps": len(gap_report["category_gaps"]),
             "n_samples": n_samples,
             "n_clusters": num_clusters,
+            "n_fresh_embeddings": success,
+            "n_from_cache": cache_hits,
+            "n_already_embedded": already_embedded,
+            "n_failed_embeddings": fail,
         }
 
     def resolve_output(self, ctx):
@@ -1010,6 +1243,10 @@ class AnalyzeCoverage(foo.Operator):
         outputs.int("n_category_gaps", label="Category Gaps Found")
         outputs.int("n_samples", label="Samples Analyzed")
         outputs.int("n_clusters", label="Clusters Created")
+        outputs.int("n_fresh_embeddings", label="Embeddings (fresh API calls)")
+        outputs.int("n_from_cache", label="Embeddings (loaded from cache)")
+        outputs.int("n_already_embedded", label="Embeddings (already on sample)")
+        outputs.int("n_failed_embeddings", label="Embedding Failures")
         return types.Property(
             outputs,
             view=types.View(label="Coverage Analysis Complete"),
@@ -1179,8 +1416,11 @@ class CoveragePanel(Panel):
         ctx.panel.state.has_data = True
         score = gap_report.get("coverage_score", 0.0)
 
-        # Collect per-sample data grouped by cluster
+        # Collect per-sample data. HDBSCAN noise (cluster_id = -1) is split
+        # into a dedicated bucket so we can render it as visually distinct
+        # gray/hollow markers instead of another color in the cluster rotation.
         clusters = {}
+        noise_bucket = {"x": [], "y": [], "ids": [], "text": []}
         max_dist = 0.001
 
         for sample in dataset:
@@ -1195,12 +1435,23 @@ class CoveragePanel(Panel):
             if ux is None or uy is None or cid is None:
                 continue
 
+            fname = os.path.basename(sample.filepath)
+
+            if cid == -1:
+                noise_bucket["x"].append(ux)
+                noise_bucket["y"].append(uy)
+                noise_bucket["ids"].append(sample.id)
+                noise_bucket["text"].append(
+                    f"{fname}<br>Outlier (HDBSCAN noise)<br>"
+                    f"Nearest-centroid distance: {cdist:.3f}"
+                )
+                continue
+
             if cid not in clusters:
                 clusters[cid] = {
                     "label": clabel, "x": [], "y": [],
                     "ids": [], "text": [], "dists": [],
                 }
-            fname = os.path.basename(sample.filepath)
             clusters[cid]["x"].append(ux)
             clusters[cid]["y"].append(uy)
             clusters[cid]["ids"].append(sample.id)
@@ -1211,7 +1462,7 @@ class CoveragePanel(Panel):
             if cdist > max_dist:
                 max_dist = cdist
 
-        if not clusters:
+        if not clusters and not noise_bucket["x"]:
             ctx.panel.state.has_data = False
             return
 
@@ -1232,6 +1483,26 @@ class CoveragePanel(Panel):
                 "ids": c["ids"],
                 "marker": {"size": sizes, "opacity": 0.75},
                 "text": c["text"],
+                "hovertemplate": "%{text}<extra></extra>",
+            })
+
+        # Noise / outliers — gray hollow circles so they sit behind clusters
+        # visually but stay clickable and findable in the legend.
+        if noise_bucket["x"]:
+            traces.append({
+                "type": "scatter",
+                "mode": "markers",
+                "name": f"Outliers ({len(noise_bucket['x'])})",
+                "x": noise_bucket["x"],
+                "y": noise_bucket["y"],
+                "ids": noise_bucket["ids"],
+                "marker": {
+                    "size": 9,
+                    "color": "rgba(0,0,0,0)",
+                    "line": {"color": "rgba(140,140,140,0.9)", "width": 1.5},
+                    "symbol": "circle-open",
+                },
+                "text": noise_bucket["text"],
                 "hovertemplate": "%{text}<extra></extra>",
             })
 
@@ -1277,10 +1548,13 @@ class CoveragePanel(Panel):
         ctx.panel.state.plot_layout = layout
 
         # Score markdown
+        n_clustered_samples = sum(len(c["x"]) for c in clusters.values())
+        n_noise = len(noise_bucket["x"])
+        noise_suffix = f" · **{n_noise} outliers**" if n_noise else ""
         ctx.panel.state.score_md = (
             f"# Dataset Coverage: {score:.0%}\n\n"
             f"**{len(clusters)} clusters** across "
-            f"**{sum(len(c['x']) for c in clusters.values())} samples**"
+            f"**{n_clustered_samples} samples**{noise_suffix}"
         )
 
         # Summary table
@@ -1298,6 +1572,10 @@ class CoveragePanel(Panel):
             label = c["label"][:50]
             status = "**Sparse**" if cid in sparse_ids else "OK"
             lines.append(f"| {cid} | {label} | {count} | {status} |")
+        if n_noise:
+            lines.append(
+                f"| — | Outliers (HDBSCAN noise) | {n_noise} | **Outlier** |"
+            )
 
         if category_gaps:
             lines += [
