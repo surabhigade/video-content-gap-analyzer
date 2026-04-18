@@ -22,6 +22,8 @@ import fiftyone as fo
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
 from fiftyone.operators.panel import Panel, PanelConfig
+from scipy.spatial import ConvexHull, Voronoi
+from scipy.spatial.qhull import QhullError
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_distances, cosine_similarity
 from sklearn.preprocessing import normalize
@@ -67,13 +69,38 @@ UMAP_METRIC = "cosine"
 UMAP_MIN_DIST = 0.1
 UMAP_RANDOM_STATE = 42
 
-# Pegasus descriptions
-REPS_PER_CLUSTER = 2
-INDEX_NAME_PREFIX = "gap-analyzer"
-PEGASUS_PROMPT = (
-    "Describe the main activity, setting, and key objects visible "
-    "in this video in one concise sentence."
+# Pegasus descriptions — sample up to this many reps per cluster in a
+# diverse mix: the 2 closest to the centroid (prototypical), 1 from the
+# cluster boundary (atypical for the cluster), and 1 random sample.
+PEGASUS_REPS_NEAREST = 2
+PEGASUS_REPS_BOUNDARY = 1
+PEGASUS_REPS_RANDOM = 1
+PEGASUS_REPS_TOTAL = (
+    PEGASUS_REPS_NEAREST + PEGASUS_REPS_BOUNDARY + PEGASUS_REPS_RANDOM
 )
+
+# Seed the per-cluster random picker so descriptions are reproducible
+# across re-runs on the same dataset.
+PEGASUS_RANDOM_SEED = 42
+
+INDEX_NAME_PREFIX = "gap-analyzer"
+
+# Structured prompt — the two labeled sections drive two FiftyOne fields:
+# ``cluster_label`` holds the aggregated COMMON descriptions, and
+# ``cluster_diversity`` holds the aggregated VARIATION notes. Keeping the
+# labels explicit lets us parse even when Pegasus runs the two sections
+# together on one line.
+PEGASUS_PROMPT = (
+    "Describe this video in two labeled sections:\n"
+    "COMMON: a single concise sentence about the main activity, setting, "
+    "and key objects — the kind of detail that would likely hold for other "
+    "videos of the same topic.\n"
+    "VARIATION: a brief phrase (a few words) naming any distinctive element "
+    "that could vary within a group of similar videos — unusual angle, "
+    "specific subject detail, lighting, or timing. If nothing stands out, "
+    "say 'typical example'."
+)
+
 POLL_INTERVAL = 10.0
 RATE_LIMIT_WAIT = 30
 
@@ -81,7 +108,25 @@ RATE_LIMIT_WAIT = 30
 SPARSE_THRESHOLD = 3
 GAP_SIMILARITY_THRESHOLD = 0.30
 ISOLATION_STD_FACTOR = 1.5
-COVERAGE_GRID_SIZE = 10
+
+# Voronoi coverage — cells smaller than `median_area * VORONOI_CELL_THRESHOLD_FACTOR`
+# are treated as "well-covered" (dense region). Coverage is the fraction of the
+# convex hull's area these small cells occupy. 1.5 × median keeps the threshold
+# self-calibrating: dataset density varies, but the median does too.
+VORONOI_CELL_THRESHOLD_FACTOR = 1.5
+
+# Gap-priority scoring — three weights that blend into a [0, 100] score
+# attached to every detected gap so the report can sort by importance.
+#   distance:  how far (cosine) the gap sits from the nearest cluster
+#   expected:  hard yes/no boost for user-listed categories
+#   isolation: the nearest cluster's own distance to its nearest peer —
+#              gaps in sparse regions are harder to fill and rank higher
+# Weights are linearly normalized; the defaults sum to 1.0. Edit these
+# constants (or pass ``weights`` to score_gap_priority directly) to rebalance
+# what the report treats as most important.
+GAP_PRIORITY_WEIGHT_DISTANCE = 0.5
+GAP_PRIORITY_WEIGHT_EXPECTED = 0.3
+GAP_PRIORITY_WEIGHT_ISOLATION = 0.2
 
 # Embedding concurrency — caps simultaneous Twelve Labs embed calls.
 # Matches Marengo's documented rate-limit headroom; raise only if you're
@@ -437,7 +482,21 @@ def run_clustering(
 # ============================================================
 
 def find_cluster_representatives(dataset: fo.Dataset) -> dict:
-    """For each cluster_id, find the REPS_PER_CLUSTER samples closest to centroid."""
+    """Pick a diverse set of representatives per (non-noise) cluster.
+
+    For each cluster we select, in order:
+      - ``PEGASUS_REPS_NEAREST`` samples closest to the centroid (prototypes)
+      - ``PEGASUS_REPS_BOUNDARY`` sample(s) at the cluster's far edge
+        (highest centroid distance — atypical-but-still-belongs)
+      - ``PEGASUS_REPS_RANDOM`` sample(s) drawn randomly from the rest
+        (captures variation the first three might miss)
+
+    Duplicates are skipped — a small cluster just gets however many unique
+    samples it can offer. Random draws are seeded per-cluster so the pick
+    is reproducible across re-runs on the same dataset.
+    """
+    import random as _random
+
     clusters = defaultdict(list)
 
     for sample in dataset:
@@ -454,7 +513,36 @@ def find_cluster_representatives(dataset: fo.Dataset) -> dict:
     representatives = {}
     for cid in sorted(clusters.keys()):
         sorted_samples = sorted(clusters[cid], key=lambda x: x[0])
-        representatives[cid] = [s for _, s in sorted_samples[:REPS_PER_CLUSTER]]
+        n = len(sorted_samples)
+
+        reps = []
+        chosen_ids = set()
+
+        def _add(sample) -> None:
+            if sample.id not in chosen_ids:
+                reps.append(sample)
+                chosen_ids.add(sample.id)
+
+        # 2 (or fewer) nearest-centroid samples — the prototype pair
+        for i in range(min(PEGASUS_REPS_NEAREST, n)):
+            _add(sorted_samples[i][1])
+
+        # 1 boundary sample — highest centroid distance within the cluster
+        for i in range(PEGASUS_REPS_BOUNDARY):
+            if n - 1 - i < 0:
+                break
+            _add(sorted_samples[-(i + 1)][1])
+
+        # 1 random sample from anything not yet chosen (deterministic seed)
+        remaining = [s for _, s in sorted_samples if s.id not in chosen_ids]
+        if remaining and PEGASUS_REPS_RANDOM > 0:
+            rng = _random.Random(PEGASUS_RANDOM_SEED + int(cid))
+            for _ in range(min(PEGASUS_REPS_RANDOM, len(remaining))):
+                pick = rng.choice(remaining)
+                _add(pick)
+                remaining.remove(pick)
+
+        representatives[cid] = reps
 
     return representatives
 
@@ -525,17 +613,67 @@ def index_and_analyze(
     return response.data
 
 
+def parse_pegasus_response(text: str) -> tuple:
+    """Split a Pegasus COMMON/VARIATION labeled response into two strings.
+
+    Tolerates:
+      - either label missing
+      - labels in any case, with or without markdown bolding
+      - multi-line content (lines following a label belong to that label
+        until the next label shows up)
+      - entirely unlabeled text (falls back to ``(text, "")``)
+    """
+    if not text:
+        return "", ""
+
+    text = text.strip()
+    # Strip common markdown affordances Pegasus sometimes emits
+    cleaned = text.replace("**", "").replace("__", "")
+
+    buf = {"common": [], "variation": []}
+    current = None
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        upper = stripped.upper()
+        if upper.startswith("COMMON:"):
+            current = "common"
+            rest = stripped[len("COMMON:"):].strip()
+            if rest:
+                buf[current].append(rest)
+        elif upper.startswith("VARIATION:"):
+            current = "variation"
+            rest = stripped[len("VARIATION:"):].strip()
+            if rest:
+                buf[current].append(rest)
+        elif current is not None:
+            buf[current].append(stripped)
+
+    common = " ".join(buf["common"]).strip()
+    variation = " ".join(buf["variation"]).strip()
+
+    # Fallback: the model ignored labels — treat the whole reply as common.
+    if not common and not variation:
+        common = cleaned.strip()
+
+    return common, variation
+
+
 def generate_description(
     client: TwelveLabs, filepath: str, use_indexing: bool, index_id: Optional[str]
 ) -> tuple:
     """Generate a Pegasus description for a video.
 
-    Returns (description_or_None, use_indexing_updated).
+    Returns ``(common, variation, use_indexing_updated)`` where ``common``
+    and ``variation`` are the two parsed sections of the Pegasus reply
+    (either may be empty). On failure both strings are empty.
+
     Handles rate limits and approach fallback (A -> B).
     """
     asset = upload_asset(client, filepath)
     if asset is None:
-        return None, use_indexing
+        return "", "", use_indexing
 
     for attempt in range(2):
         try:
@@ -545,9 +683,9 @@ def generate_description(
                 text = analyze_via_asset(client, asset.id, PEGASUS_PROMPT)
 
             if text:
-                return text.strip(), use_indexing
-            else:
-                return None, use_indexing
+                common, variation = parse_pegasus_response(text)
+                return common, variation, use_indexing
+            return "", "", use_indexing
 
         except Exception as e:
             error_str = str(e).lower()
@@ -558,36 +696,48 @@ def generate_description(
                     logger.info("Rate limited, waiting %ds...", RATE_LIMIT_WAIT)
                     time.sleep(RATE_LIMIT_WAIT)
                     continue
-                else:
-                    return None, use_indexing
+                return "", "", use_indexing
 
             # Non-rate-limit error on Approach A: switch to B
             if not use_indexing:
                 logger.info("Direct analysis failed, switching to index-based approach")
-                return None, True
+                return "", "", True
 
             # Approach B failure
             logger.warning("Description generation failed: %s", e)
-            return None, use_indexing
+            return "", "", use_indexing
 
-    return None, use_indexing
+    return "", "", use_indexing
 
 
 def generate_cluster_labels(
     client: TwelveLabs, dataset: fo.Dataset, use_pegasus: bool, ctx
 ) -> dict:
-    """Generate labels for each cluster and write cluster_label to all samples.
+    """Generate per-cluster descriptions via Pegasus and write two sample fields.
 
-    Returns dict {cluster_id: label_str}.
+    For each (non-noise) cluster we sample up to ``PEGASUS_REPS_TOTAL`` diverse
+    representatives (see ``find_cluster_representatives``), send each one to
+    Pegasus with a labeled prompt, and aggregate the results into:
+
+    * ``cluster_label`` — joined COMMON descriptions (what the reps share)
+    * ``cluster_diversity`` — joined VARIATION notes (how they differ)
+
+    When ``use_pegasus`` is False, both fields fall back to ``"Cluster N"``
+    and an empty string so the downstream UI still has something to show.
+
+    Returns ``{cluster_id: label_str}`` for call-site compatibility; the
+    diversity mapping is written directly onto the samples.
     """
     representatives = find_cluster_representatives(dataset)
     cluster_labels = {}
+    cluster_diversity = {}
     n_clusters = len(representatives)
 
     if not use_pegasus:
-        # Fast path: generic labels
+        # Fast path: generic labels, no diversity info.
         for cid in sorted(representatives.keys()):
             cluster_labels[cid] = f"Cluster {cid}"
+            cluster_diversity[cid] = ""
     else:
         use_indexing = False
         index_id = None
@@ -599,39 +749,52 @@ def generate_cluster_labels(
             )
 
             samples = representatives[cid]
-            descriptions = []
+            commons = []
+            variations = []
 
             if use_indexing and index_id is None:
                 index_id = create_pegasus_index(client)
 
             for sample in samples:
-                desc, use_indexing_new = generate_description(
+                common, variation, use_indexing_new = generate_description(
                     client, sample.filepath, use_indexing, index_id
                 )
 
-                # Handle approach switch
+                # Approach-A → Approach-B switch: if the direct call failed
+                # with a non-rate-limit error, retry this sample via indexing.
                 if use_indexing_new and not use_indexing:
                     use_indexing = True
                     if index_id is None:
                         index_id = create_pegasus_index(client)
-                    desc, _ = generate_description(
+                    common, variation, _ = generate_description(
                         client, sample.filepath, use_indexing, index_id
                     )
 
-                if desc:
-                    descriptions.append(desc)
+                if common:
+                    commons.append(common)
+                if variation:
+                    variations.append(variation)
 
-            # Combine descriptions into label
-            if len(descriptions) >= 2:
-                cluster_labels[cid] = f"{descriptions[0]}; {descriptions[1]}"
-            elif len(descriptions) == 1:
-                cluster_labels[cid] = descriptions[0]
+            # Label = the common descriptions joined (first two get the
+            # most weight — they come from the two nearest-centroid reps).
+            if commons:
+                cluster_labels[cid] = "; ".join(commons[:PEGASUS_REPS_NEAREST]) or commons[0]
             else:
                 cluster_labels[cid] = f"Cluster {cid}"
 
-    # Apply labels to all samples. HDBSCAN noise points (cid=-1) never get a
-    # description pass above, so tag them with a clear marker instead of
-    # leaving the field blank.
+            # Diversity note = the variation phrases from every rep that
+            # produced one, deduplicated while preserving order.
+            seen = set()
+            deduped = []
+            for v in variations:
+                key = v.lower()
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(v)
+            cluster_diversity[cid] = "; ".join(deduped)
+
+    # Apply both fields to every sample. HDBSCAN noise (cid=-1) never got
+    # descriptions above, so tag with a clear marker and an empty diversity.
     NOISE_LABEL = "Outliers (HDBSCAN noise)"
     for sample in dataset:
         try:
@@ -642,9 +805,11 @@ def generate_cluster_labels(
             continue
         if cid == -1:
             sample["cluster_label"] = NOISE_LABEL
+            sample["cluster_diversity"] = ""
             sample.save()
         elif cid in cluster_labels:
             sample["cluster_label"] = cluster_labels[cid]
+            sample["cluster_diversity"] = cluster_diversity.get(cid, "")
             sample.save()
 
     dataset.save()
@@ -783,34 +948,254 @@ def detect_isolated_clusters(
     return isolated
 
 
+# ------------------------------------------------------------
+# Voronoi-based coverage helpers
+# ------------------------------------------------------------
+
+def _polygon_area(verts) -> float:
+    """Shoelace area of a polygon; orientation-agnostic via abs()."""
+    v = np.asarray(verts, dtype=float)
+    if v.ndim != 2 or v.shape[0] < 3:
+        return 0.0
+    x = v[:, 0]
+    y = v[:, 1]
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2.0)
+
+
+def _ensure_ccw(verts) -> np.ndarray:
+    """Return the polygon with counter-clockwise winding."""
+    v = np.asarray(verts, dtype=float)
+    signed = (v[:, 0] * np.roll(v[:, 1], -1) - v[:, 1] * np.roll(v[:, 0], -1)).sum() / 2.0
+    return v if signed > 0 else v[::-1]
+
+
+def _is_left_of_edge(p, a, b) -> bool:
+    """Left-of-edge test for a directed CCW edge a->b."""
+    return ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) >= 0.0
+
+
+def _line_segment_intersect(p1, p2, a, b):
+    """Intersect segment p1->p2 with the infinite line through a->b."""
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = a
+    x4, y4 = b
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-12:
+        return p1  # ~parallel — degenerate; caller rarely hits this path
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+    return (x1 - t * (x1 - x2), y1 - t * (y1 - y2))
+
+
+def _clip_polygon_convex(subject, clip_ccw) -> list:
+    """Sutherland-Hodgman: clip ``subject`` polygon against convex ``clip_ccw``."""
+    output = [tuple(p) for p in subject]
+    n = len(clip_ccw)
+    for i in range(n):
+        if not output:
+            break
+        a = tuple(clip_ccw[i])
+        b = tuple(clip_ccw[(i + 1) % n])
+        input_list = output
+        output = []
+        m = len(input_list)
+        for j in range(m):
+            p = input_list[j]
+            q = input_list[(j + 1) % m]
+            p_in = _is_left_of_edge(p, a, b)
+            q_in = _is_left_of_edge(q, a, b)
+            if p_in:
+                output.append(p)
+                if not q_in:
+                    output.append(_line_segment_intersect(p, q, a, b))
+            elif q_in:
+                output.append(_line_segment_intersect(p, q, a, b))
+    return output
+
+
 def compute_umap_coverage(
-    umap_coords: np.ndarray, grid_size: int = COVERAGE_GRID_SIZE
+    umap_coords: np.ndarray,
+    cell_threshold_factor: float = VORONOI_CELL_THRESHOLD_FACTOR,
 ) -> float:
-    """Compute what fraction of the UMAP bounding box is occupied."""
-    x_min, x_max = umap_coords[:, 0].min(), umap_coords[:, 0].max()
-    y_min, y_max = umap_coords[:, 1].min(), umap_coords[:, 1].max()
+    """Voronoi-based density coverage over the convex hull of UMAP points.
 
-    x_range = x_max - x_min
-    y_range = y_max - y_min
+    Each point's Voronoi cell (clipped to the hull) is small when the point
+    sits in a dense region and large when it's isolated. The coverage score
+    is the fraction of the convex hull's area occupied by cells whose area
+    is *below* ``median_area × cell_threshold_factor`` — i.e. the
+    well-covered, high-density share of the data envelope.
 
-    if x_range == 0 or y_range == 0:
+    Returns 0.0 for degenerate inputs (fewer than 4 points, collinear
+    points, or any Qhull failure).
+    """
+    coords = np.asarray(umap_coords, dtype=float)
+    n = coords.shape[0]
+    if n < 4:
         return 0.0
 
-    x_min -= 0.01 * x_range
-    x_max += 0.01 * x_range
-    y_min -= 0.01 * y_range
-    y_max += 0.01 * y_range
+    try:
+        hull = ConvexHull(coords)
+    except QhullError as e:
+        logger.warning("ConvexHull failed (%s); coverage = 0", e)
+        return 0.0
 
-    cell_w = (x_max - x_min) / grid_size
-    cell_h = (y_max - y_min) / grid_size
+    hull_verts_ccw = _ensure_ccw(coords[hull.vertices])
+    hull_area = _polygon_area(hull_verts_ccw)
+    if hull_area <= 0.0:
+        return 0.0
 
-    occupied = set()
-    for x, y in umap_coords:
-        cx = min(int((x - x_min) / cell_w), grid_size - 1)
-        cy = min(int((y - y_min) / cell_h), grid_size - 1)
-        occupied.add((cx, cy))
+    # Pad with four far-away corner points so every ORIGINAL point's cell is
+    # bounded. Scipy's Voronoi marks boundary-point cells as unbounded (-1
+    # vertex index); padding sidesteps that without hand-reconstructing the
+    # open edges. The corner points themselves get cells we don't care about.
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+    span = max(x_max - x_min, y_max - y_min, 1.0)
+    pad = 10.0 * span
+    corners = np.array([
+        [x_min - pad, y_min - pad],
+        [x_min - pad, y_max + pad],
+        [x_max + pad, y_min - pad],
+        [x_max + pad, y_max + pad],
+    ])
+    padded = np.vstack([coords, corners])
 
-    return len(occupied) / (grid_size * grid_size)
+    try:
+        vor = Voronoi(padded)
+    except QhullError as e:
+        logger.warning("Voronoi failed (%s); coverage = 0", e)
+        return 0.0
+
+    cell_areas = []
+    for i in range(n):
+        region_idx = vor.point_region[i]
+        region = vor.regions[region_idx]
+        if not region or -1 in region:
+            # Padding should prevent this, but stay safe.
+            continue
+        cell = vor.vertices[region]
+        clipped = _clip_polygon_convex(cell, hull_verts_ccw)
+        area = _polygon_area(clipped)
+        if area > 0.0:
+            cell_areas.append(area)
+
+    if not cell_areas:
+        return 0.0
+
+    cell_areas_arr = np.array(cell_areas)
+    threshold = float(np.median(cell_areas_arr)) * cell_threshold_factor
+    dense_area = float(cell_areas_arr[cell_areas_arr < threshold].sum())
+
+    return float(dense_area / hull_area)
+
+
+def _clip01(x: float) -> float:
+    """Clamp a float into [0.0, 1.0]."""
+    return max(0.0, min(1.0, float(x)))
+
+
+def score_gap_priority(
+    centroid_distance: float,
+    is_user_expected: bool,
+    isolation: float,
+    weights: Optional[tuple] = None,
+) -> float:
+    """Return a 0-100 priority score combining three factors.
+
+    - ``centroid_distance`` (cosine): how far the gap sits from the nearest
+      existing cluster. Larger = further from any data we have.
+    - ``is_user_expected``: True if this gap corresponds to a category the
+      user listed in ``expected_categories`` — a hard yes/no boost for
+      user-defined importance.
+    - ``isolation`` (cosine): distance between the nearest cluster and its
+      own nearest peer cluster. Gaps near an already-sparse region are
+      harder to fill, so they should surface higher.
+
+    Weights default to the ``GAP_PRIORITY_WEIGHT_*`` module constants but
+    callers can pass an explicit ``(w_distance, w_expected, w_isolation)``
+    triple. Weights are linearly normalized, so any proportional triple
+    works.
+    """
+    if weights is None:
+        weights = (
+            GAP_PRIORITY_WEIGHT_DISTANCE,
+            GAP_PRIORITY_WEIGHT_EXPECTED,
+            GAP_PRIORITY_WEIGHT_ISOLATION,
+        )
+    w_d, w_e, w_i = weights
+    w_sum = w_d + w_e + w_i
+    if w_sum <= 0:
+        return 0.0
+    raw = (
+        w_d * _clip01(centroid_distance)
+        + w_e * (1.0 if is_user_expected else 0.0)
+        + w_i * _clip01(isolation)
+    ) / w_sum
+    return round(100.0 * raw, 2)
+
+
+def compute_cluster_isolation(
+    centroids: np.ndarray, unique_ids: np.ndarray
+) -> dict:
+    """Per-cluster cosine distance to the nearest other cluster centroid.
+
+    Returns ``{cluster_id: float}`` keyed on non-noise cluster IDs. With
+    fewer than two clusters there are no "others" to measure against, so
+    every entry is 0.0.
+    """
+    isolation_map = {int(cid): 0.0 for cid in unique_ids}
+    n = len(unique_ids)
+    if n < 2:
+        return isolation_map
+
+    dist_matrix = cosine_distances(centroids, centroids)
+    np.fill_diagonal(dist_matrix, np.inf)  # exclude self from the nearest lookup
+    for i, cid in enumerate(unique_ids):
+        isolation_map[int(cid)] = float(dist_matrix[i].min())
+    return isolation_map
+
+
+def parse_category_hierarchy(text: str) -> list:
+    """Parse the hierarchical ``expected_categories`` input string.
+
+    Format: ``"parent1: child1, child2 | parent2: child3, child4"``.
+    Pipes separate top-level groups; a colon inside a group splits parent
+    from its comma-separated children. A group without a colon is treated
+    as a parent whose single leaf *is itself* — which makes the flat legacy
+    format (``"a, b, c"``, treated as three groups separated by pipes if
+    present, else one parent with children ``a, b, c``) still work.
+
+    Returns a list of ``(parent, [child, ...])`` tuples with at least one
+    child per parent. Empty / whitespace-only pieces are dropped.
+    """
+    if not text or not text.strip():
+        return []
+
+    # Split on pipe first; if there are no pipes AND no colons, the legacy
+    # flat form ``"a, b, c"`` is a single group of comma-separated leaves.
+    # We surface each as its own parent so callers treating every leaf as
+    # a top-level category keep working.
+    if "|" not in text and ":" not in text:
+        leaves = [p.strip() for p in text.split(",") if p.strip()]
+        return [(leaf, [leaf]) for leaf in leaves]
+
+    groups = [g.strip() for g in text.split("|") if g.strip()]
+    hierarchy = []
+    for g in groups:
+        if ":" in g:
+            parent_str, children_str = g.split(":", 1)
+            parent = parent_str.strip()
+            children = [c.strip() for c in children_str.split(",") if c.strip()]
+        else:
+            parent = g.strip()
+            children = []
+        if not parent:
+            continue
+        if not children:
+            # No explicit children — parent is its own leaf.
+            children = [parent]
+        hierarchy.append((parent, children))
+    return hierarchy
 
 
 def embed_categories(client: TwelveLabs, categories: list) -> dict:
@@ -850,42 +1235,116 @@ def embed_categories(client: TwelveLabs, categories: list) -> dict:
 
 
 def detect_category_gaps(
+    hierarchy: list,
     category_embeddings: dict,
-    embeddings_norm: np.ndarray,
-    cluster_ids: np.ndarray,
+    centroids: np.ndarray,
     unique_ids: np.ndarray,
     cluster_labels_map: dict,
+    cluster_umap_centers: dict,
+    cluster_isolation_map: dict,
     threshold: float = GAP_SIMILARITY_THRESHOLD,
-    umap_coords: Optional[np.ndarray] = None,
-) -> list:
-    """Compare each category embedding to all sample embeddings."""
-    categories = list(category_embeddings.keys())
-    cat_matrix = np.array([category_embeddings[c] for c in categories])
+) -> tuple:
+    """Match each leaf category against cluster centroids (not sample points).
 
-    sim_matrix = cosine_similarity(cat_matrix, embeddings_norm)
+    Matching against centroids is the Phase 3.1 design: comparing text against
+    per-cluster means is a stabler signal than against individual samples,
+    and it makes parent-level aggregation sensible.
 
-    results = []
-    for i, category in enumerate(categories):
-        max_sim = float(sim_matrix[i].max())
-        closest_sample_idx = int(sim_matrix[i].argmax())
-        closest_cid = int(cluster_ids[closest_sample_idx])
-        closest_label = cluster_labels_map.get(closest_cid, f"Cluster {closest_cid}")
+    Args:
+        hierarchy: [(parent, [child, ...]), ...] from parse_category_hierarchy
+        category_embeddings: {leaf_str: np.ndarray(D,)} from embed_categories
+        centroids: (K, D) L2-normalized cluster centroids (no -1 / noise)
+        unique_ids: (K,) cluster IDs matching ``centroids`` row order
+        cluster_labels_map: {cid -> human label}
+        cluster_umap_centers: {cid -> (mean_umap_x, mean_umap_y)} — used for
+            placing the "Missing" marker near the nearest cluster on the UMAP
+        threshold: cosine-similarity floor below which a child is a gap
 
-        result = {
-            "category": category,
-            "closest_cluster": closest_label,
-            "closest_cluster_id": closest_cid,
-            "similarity": round(max_sim, 4),
-            "is_gap": max_sim < threshold,
+    Returns (hierarchy_report, flat_gaps).
+
+    hierarchy_report is a list of
+        {parent, n_children, n_covered, coverage, best_similarity, children: [...]}
+    where each child is
+        {category, similarity, closest_cluster, closest_cluster_id,
+         is_gap, umap_x, umap_y}.
+
+    flat_gaps is the flat list of missing children (is_gap=True), kept for
+    the CoveragePanel's "Missing Categories" scatter trace which expects the
+    old shape.
+    """
+    if len(centroids) == 0 or not category_embeddings:
+        return [], []
+
+    # Pre-compute sim(leaf, centroid) for every embedded leaf in one shot.
+    leaves = list(category_embeddings.keys())
+    leaf_matrix = np.array([category_embeddings[leaf] for leaf in leaves])
+    sim_matrix = cosine_similarity(leaf_matrix, centroids)  # (L, K)
+
+    leaf_to_row = {leaf: idx for idx, leaf in enumerate(leaves)}
+
+    def _child_record(leaf: str) -> Optional[dict]:
+        row = leaf_to_row.get(leaf)
+        if row is None:
+            return None
+        sims = sim_matrix[row]
+        best_col = int(sims.argmax())
+        best_cid = int(unique_ids[best_col])
+        best_sim = float(sims[best_col])
+        umap_xy = cluster_umap_centers.get(best_cid, (0.0, 0.0))
+        is_gap = best_sim < threshold
+        record = {
+            "category": leaf,
+            "similarity": round(best_sim, 4),
+            "closest_cluster": cluster_labels_map.get(best_cid, f"Cluster {best_cid}"),
+            "closest_cluster_id": best_cid,
+            "is_gap": is_gap,
+            "umap_x": float(umap_xy[0]),
+            "umap_y": float(umap_xy[1]),
         }
+        # Priority score — only meaningful for entries that actually are gaps.
+        # Every leaf here came from the user's expected_categories input, so
+        # the "is_user_expected" factor is always True.
+        if is_gap:
+            centroid_distance = _clip01(1.0 - best_sim)
+            isolation = cluster_isolation_map.get(best_cid, 0.0)
+            record["priority_score"] = score_gap_priority(
+                centroid_distance=centroid_distance,
+                is_user_expected=True,
+                isolation=isolation,
+            )
+        return record
 
-        if umap_coords is not None:
-            result["umap_x"] = float(umap_coords[closest_sample_idx, 0])
-            result["umap_y"] = float(umap_coords[closest_sample_idx, 1])
+    hierarchy_report = []
+    flat_gaps = []
+    for parent, children in hierarchy:
+        child_records = []
+        for child in children:
+            rec = _child_record(child)
+            if rec is None:
+                # Embedding failed for this leaf — skip silently; it'll show
+                # up as missing from the report rather than crashing the run.
+                continue
+            child_records.append(rec)
 
-        results.append(result)
+        if not child_records:
+            continue
 
-    return results
+        n_total = len(child_records)
+        n_covered = sum(1 for r in child_records if not r["is_gap"])
+        best_sim = max(r["similarity"] for r in child_records)
+
+        hierarchy_report.append({
+            "parent": parent,
+            "n_children": n_total,
+            "n_covered": n_covered,
+            "coverage": round(n_covered / n_total, 4) if n_total else 0.0,
+            "best_similarity": round(best_sim, 4),
+            "children": child_records,
+        })
+
+        flat_gaps.extend(r for r in child_records if r["is_gap"])
+
+    return hierarchy_report, flat_gaps
 
 
 def tag_sparse_samples(dataset: fo.Dataset, sparse_cluster_ids: set) -> int:
@@ -911,9 +1370,14 @@ def detect_gaps(
     ctx,
     gap_threshold: float = GAP_SIMILARITY_THRESHOLD,
 ) -> dict:
-    """Run full gap detection (structural + category-driven).
+    """Run full gap detection (structural + hierarchical category-driven).
 
-    Returns gap_report dict.
+    ``expected_categories`` here is the parsed hierarchy
+    ``[(parent, [child, ...]), ...]`` — parsing happens upstream in the
+    operator so the caller can log or surface what it interpreted.
+
+    Returns gap_report dict with both a flat ``category_gaps`` list (for
+    Panel compatibility) and a nested ``category_hierarchy`` breakdown.
     """
     ctx.set_progress(progress=0.75, label="Extracting cluster data...")
 
@@ -923,30 +1387,76 @@ def detect_gaps(
     embeddings_norm = normalize(embeddings, norm="l2")
     centroids, unique_ids = compute_centroids(embeddings_norm, cluster_ids)
 
+    # UMAP mean per cluster — used to place the "Missing Categories" marker
+    # on the Panel near the closest cluster's visual center.
+    cluster_umap_centers = {}
+    for cid in unique_ids:
+        mask = cluster_ids == cid
+        if mask.any():
+            cluster_umap_centers[int(cid)] = (
+                float(umap_coords[mask, 0].mean()),
+                float(umap_coords[mask, 1].mean()),
+            )
+
+    # Per-cluster isolation — distance to the *nearest other* cluster.
+    # Feeds the isolation factor of score_gap_priority for both category
+    # gaps and sparse clusters.
+    cluster_isolation_map = compute_cluster_isolation(centroids, unique_ids)
+
     # Structural analysis
     ctx.set_progress(progress=0.80, label="Detecting sparse and isolated clusters...")
     sparse_clusters = detect_sparse_clusters(cluster_ids, cluster_labels_map)
     isolated_clusters = detect_isolated_clusters(centroids, unique_ids, cluster_labels_map)
     umap_coverage = compute_umap_coverage(umap_coords)
 
-    # Category-driven analysis
-    category_results = []
+    # Sparse clusters are "gaps" in the sense that a known region has too
+    # few samples. Their centroid-distance factor is 0 (they aren't distant
+    # from existing data — they ARE existing data, just thin), so their
+    # priority rides on isolation alone. Sparse clusters that also sit far
+    # from the rest of the dataset surface to the top.
+    for sc in sparse_clusters:
+        sc["priority_score"] = score_gap_priority(
+            centroid_distance=0.0,
+            is_user_expected=False,
+            isolation=cluster_isolation_map.get(sc["cluster_id"], 0.0),
+        )
+
+    # Category-driven analysis (hierarchical)
+    hierarchy_report = []
+    flat_gaps = []
     category_coverage = 0.0
+    total_leaves = 0
+    covered_leaves = 0
 
     if expected_categories:
-        ctx.set_progress(progress=0.85, label="Embedding expected categories...")
-        category_embeddings = embed_categories(client, expected_categories)
-
-        if category_embeddings:
-            ctx.set_progress(progress=0.90, label="Computing category gaps...")
-            category_results = detect_category_gaps(
-                category_embeddings, embeddings_norm, cluster_ids,
-                unique_ids, cluster_labels_map,
-                threshold=gap_threshold,
-                umap_coords=umap_coords,
+        # Flatten the hierarchy into the unique set of leaves we need to embed.
+        unique_leaves = list(dict.fromkeys(
+            child for _, children in expected_categories for child in children
+        ))
+        if unique_leaves:
+            ctx.set_progress(
+                progress=0.85,
+                label=f"Embedding {len(unique_leaves)} expected categories...",
             )
-            n_covered = sum(1 for cr in category_results if not cr["is_gap"])
-            category_coverage = n_covered / len(category_results)
+            category_embeddings = embed_categories(client, unique_leaves)
+
+            if category_embeddings and len(centroids) > 0:
+                ctx.set_progress(progress=0.90, label="Computing category gaps...")
+                hierarchy_report, flat_gaps = detect_category_gaps(
+                    expected_categories,
+                    category_embeddings,
+                    centroids,
+                    unique_ids,
+                    cluster_labels_map,
+                    cluster_umap_centers,
+                    cluster_isolation_map,
+                    threshold=gap_threshold,
+                )
+                for parent_entry in hierarchy_report:
+                    total_leaves += parent_entry["n_children"]
+                    covered_leaves += parent_entry["n_covered"]
+                if total_leaves:
+                    category_coverage = covered_leaves / total_leaves
 
     # Tag sparse samples
     ctx.set_progress(progress=0.95, label="Tagging sparse cluster samples...")
@@ -954,23 +1464,43 @@ def detect_gaps(
     tag_sparse_samples(dataset, sparse_ids)
 
     # Compute coverage score
-    if category_results:
+    if total_leaves:
         combined_score = 0.5 * umap_coverage + 0.5 * category_coverage
     else:
         combined_score = umap_coverage
 
+    # Surface highest-priority sparse clusters first so the report highlights
+    # the most isolated ones at the top.
+    sparse_clusters = sorted(
+        sparse_clusters,
+        key=lambda sc: sc.get("priority_score", 0.0),
+        reverse=True,
+    )
+
     gap_report = {
         "sparse_clusters": sparse_clusters,
-        "category_gaps": [
-            {
-                "category": cr["category"],
-                "closest_cluster": cr["closest_cluster"],
-                "similarity": cr["similarity"],
-                "umap_x": cr.get("umap_x", 0.0),
-                "umap_y": cr.get("umap_y", 0.0),
-            }
-            for cr in category_results if cr["is_gap"]
-        ],
+        # Flat list — one entry per missing leaf; preserves the Panel's
+        # "Missing Categories" trace shape from before 3.1. Sorted by
+        # priority_score descending so consumers that only take the top N
+        # see the most-important gaps first.
+        "category_gaps": sorted(
+            (
+                {
+                    "category": g["category"],
+                    "closest_cluster": g["closest_cluster"],
+                    "similarity": g["similarity"],
+                    "umap_x": g.get("umap_x", 0.0),
+                    "umap_y": g.get("umap_y", 0.0),
+                    "priority_score": g.get("priority_score", 0.0),
+                }
+                for g in flat_gaps
+            ),
+            key=lambda g: g["priority_score"],
+            reverse=True,
+        ),
+        # Hierarchical breakdown: each parent with its coverage fraction and
+        # per-child matches. Consumed by ShowGapReport and CoveragePanel.
+        "category_hierarchy": hierarchy_report,
         "coverage_score": round(float(combined_score), 4),
     }
 
@@ -1018,8 +1548,18 @@ class AnalyzeCoverage(foo.Operator):
             "expected_categories",
             label="Expected Categories",
             description=(
-                "Comma-separated list of expected video categories to check "
-                "against, e.g.: person falling, forklift moving, emergency evacuation"
+                "Hierarchical categories to check for coverage. Use a "
+                "pipe ('|') between top-level categories and a colon (':') "
+                "to list sub-categories under a parent, comma-separated. "
+                "Example: 'forklift operations: forward, reverse, loading, "
+                "turning | fall hazards: ladder climb, ladder descent, "
+                "elevated platform'. Each sub-category is embedded via "
+                "Marengo text and matched against cluster centroids, so "
+                "you get both parent-level coverage (how much of your "
+                "safety taxonomy you cover overall) and child-level gaps "
+                "(which specific variant is missing). A flat "
+                "comma-separated list still works and is treated as "
+                "top-level categories with no children."
             ),
             default="",
         )
@@ -1095,10 +1635,17 @@ class AnalyzeCoverage(foo.Operator):
         gap_threshold = ctx.params.get("gap_threshold", 0.3)
         clear_cache = ctx.params.get("clear_cache", False)
 
-        # Parse categories
-        expected_categories = [
-            c.strip() for c in expected_categories_str.split(",") if c.strip()
-        ] if expected_categories_str else []
+        # Parse the hierarchical categories string into
+        # [(parent, [child, ...]), ...]. Flat legacy inputs degrade to one
+        # entry per category with the category itself as its only leaf.
+        category_hierarchy = parse_category_hierarchy(expected_categories_str)
+        if category_hierarchy:
+            n_parents = len(category_hierarchy)
+            n_leaves = sum(len(children) for _, children in category_hierarchy)
+            logger.info(
+                "Expected categories: %d parent(s), %d leaf(-ves) total",
+                n_parents, n_leaves,
+            )
 
         # Edge case: empty dataset
         total = len(dataset)
@@ -1211,7 +1758,7 @@ class AnalyzeCoverage(foo.Operator):
         # Stage 4: Gap detection (0.75 - 1.00)
         ctx.set_progress(progress=0.75, label="Stage 4/4: Detecting coverage gaps...")
         gap_report = detect_gaps(
-            client, dataset, expected_categories, ctx,
+            client, dataset, category_hierarchy, ctx,
             gap_threshold=gap_threshold,
         )
 
@@ -1290,41 +1837,109 @@ class ShowGapReport(foo.Operator):
         score = gap_report.get("coverage_score", 0.0)
         sparse = gap_report.get("sparse_clusters", [])
         gaps = gap_report.get("category_gaps", [])
+        hierarchy = gap_report.get("category_hierarchy", [])
 
         # Build markdown report
         lines = []
         lines.append(f"## Coverage Score: {score:.2f}")
         lines.append("")
 
-        # Sparse clusters
+        # Sparse clusters (sorted by priority_score descending in detect_gaps)
         if sparse:
-            lines.append(f"### Sparse Clusters ({len(sparse)})")
+            lines.append(f"### Sparse Clusters ({len(sparse)}) — ranked by priority")
             for sc in sparse:
                 label = sc["label"]
                 if len(label) > 60:
                     label = label[:60] + "..."
+                score = sc.get("priority_score", 0.0)
                 lines.append(
-                    f"- **Cluster {sc['cluster_id']}** "
+                    f"- **[Priority {score:.0f}/100]** "
+                    f"Cluster {sc['cluster_id']} "
                     f"({sc['count']} samples): {label}"
                 )
         else:
             lines.append("### Sparse Clusters: None")
         lines.append("")
 
-        # Category gaps
-        if gaps:
-            lines.append(f"### Category Gaps ({len(gaps)})")
+        # Hierarchical category coverage — parent summary + per-child detail,
+        # with gap children sorted by priority_score so the "fix this next"
+        # item is always at the top of each parent's list.
+        if hierarchy:
+            lines.append(f"### Category Coverage ({len(hierarchy)} parent groups)")
+            for entry in hierarchy:
+                parent = entry["parent"]
+                covered = entry["n_covered"]
+                total = entry["n_children"]
+                coverage_pct = entry["coverage"] * 100
+                best_sim = entry["best_similarity"]
+                lines.append(
+                    f"#### {parent} — {covered}/{total} covered "
+                    f"({coverage_pct:.0f}%, best similarity {best_sim:.2f})"
+                )
+                # Gaps first (highest priority first), then covered items.
+                ordered_children = sorted(
+                    entry["children"],
+                    key=lambda c: (
+                        0 if c["is_gap"] else 1,               # gaps before covered
+                        -float(c.get("priority_score", 0.0)),   # higher priority first
+                        c["category"],
+                    ),
+                )
+                for child in ordered_children:
+                    marker = "✗" if child["is_gap"] else "✓"
+                    nearest = child["closest_cluster"]
+                    if len(nearest) > 50:
+                        nearest = nearest[:50] + "..."
+                    priority_str = (
+                        f" [Priority {child['priority_score']:.0f}/100]"
+                        if child.get("priority_score") is not None and child["is_gap"]
+                        else ""
+                    )
+                    lines.append(
+                        f"- {marker}{priority_str} **{child['category']}** "
+                        f"(similarity: {child['similarity']:.2f}, "
+                        f"nearest: {nearest})"
+                    )
+
+            # Cross-parent "top gaps" rollup so users can see the most
+            # important items across the whole taxonomy at a glance.
+            top_gaps = sorted(
+                (
+                    (child, entry["parent"])
+                    for entry in hierarchy
+                    for child in entry["children"]
+                    if child["is_gap"]
+                ),
+                key=lambda pair: -float(pair[0].get("priority_score", 0.0)),
+            )[:5]
+            if top_gaps:
+                lines.append("")
+                lines.append("#### Top Priority Gaps (across all parents)")
+                for child, parent in top_gaps:
+                    lines.append(
+                        f"1. **[Priority {child['priority_score']:.0f}/100]** "
+                        f"{parent} → {child['category']} "
+                        f"(similarity: {child['similarity']:.2f})"
+                    )
+        elif gaps:
+            # Legacy flat fallback if a cached report predates 3.1
+            lines.append(f"### Category Gaps ({len(gaps)}) — ranked by priority")
             for cg in gaps:
                 closest = cg["closest_cluster"]
                 if len(closest) > 50:
                     closest = closest[:50] + "..."
+                priority_str = (
+                    f"[Priority {cg['priority_score']:.0f}/100] "
+                    if cg.get("priority_score") is not None
+                    else ""
+                )
                 lines.append(
-                    f"- **{cg['category']}** "
+                    f"- {priority_str}**{cg['category']}** "
                     f"(similarity: {cg['similarity']:.2f}, "
                     f"nearest: {closest})"
                 )
         else:
-            lines.append("### Category Gaps: None")
+            lines.append("### Category Coverage: (no expected_categories provided)")
         lines.append("")
 
         # Cluster summary from dataset samples
@@ -1577,7 +2192,38 @@ class CoveragePanel(Panel):
                 f"| — | Outliers (HDBSCAN noise) | {n_noise} | **Outlier** |"
             )
 
-        if category_gaps:
+        hierarchy = gap_report.get("category_hierarchy", [])
+        if hierarchy:
+            lines += [
+                "", "### Category Coverage (hierarchical)", "",
+                "| Parent | Covered | Coverage | Best Sim |",
+                "|--------|---------|----------|----------|",
+            ]
+            for entry in hierarchy:
+                pct = entry["coverage"] * 100
+                lines.append(
+                    f"| {entry['parent'][:40]} "
+                    f"| {entry['n_covered']}/{entry['n_children']} "
+                    f"| {pct:.0f}% "
+                    f"| {entry['best_similarity']:.2f} |"
+                )
+            # Per-child detail table right below the parent summary
+            lines += [
+                "", "| Parent | Sub-category | Status | Similarity | Nearest |",
+                "|--------|--------------|--------|------------|---------|",
+            ]
+            for entry in hierarchy:
+                for child in entry["children"]:
+                    status = "**MISSING**" if child["is_gap"] else "OK"
+                    lines.append(
+                        f"| {entry['parent'][:25]} "
+                        f"| {child['category'][:25]} "
+                        f"| {status} "
+                        f"| {child['similarity']:.2f} "
+                        f"| {child['closest_cluster'][:25]} |"
+                    )
+        elif category_gaps:
+            # Legacy flat fallback
             lines += [
                 "", "### Missing Categories", "",
                 "| Category | Nearest Cluster | Similarity |",
