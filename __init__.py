@@ -41,6 +41,14 @@ from twelvelabs.types import VideoContext_AssetId
 from twelvelabs.indexes import IndexesCreateRequestModelsItem
 
 from .embedding_cache import EmbeddingCache
+from .gap_report import (
+    HISTORY_INFO_KEY,
+    build_coverage_history_entry,
+    build_tiered_report,
+    compute_coverage_diff,
+    render_tiered_report_md,
+)
+from .report_export import export_coverage_report
 
 logger = logging.getLogger(__name__)
 
@@ -1764,6 +1772,15 @@ class AnalyzeCoverage(foo.Operator):
 
         # Store report
         dataset.info["gap_report"] = gap_report
+
+        # Append a lightweight history entry so subsequent runs can compute
+        # a "since last run" diff. Each entry carries timestamp, coverage
+        # score, sample + cluster counts, and the list of active gap names —
+        # enough for the ShowGapReport / Export operators to tell the user
+        # what changed without re-running the whole analysis.
+        history = list(dataset.info.get(HISTORY_INFO_KEY, []) or [])
+        history.append(build_coverage_history_entry(gap_report, dataset))
+        dataset.info[HISTORY_INFO_KEY] = history
         dataset.save()
 
         ctx.set_progress(progress=1.0, label="Analysis complete!")
@@ -1827,171 +1844,418 @@ class ShowGapReport(foo.Operator):
         gap_report = dataset.info.get("gap_report", None)
 
         if gap_report is None:
+            # resolve_output will detect this via the "_no_report" marker and
+            # render a single Error notice instead of the tiered views.
             return {
+                "_no_report": True,
                 "report": "**No gap report found.** Run 'Analyze Coverage' first.",
                 "coverage_score": 0.0,
                 "n_sparse": 0,
                 "n_gaps": 0,
             }
 
-        score = gap_report.get("coverage_score", 0.0)
-        sparse = gap_report.get("sparse_clusters", [])
-        gaps = gap_report.get("category_gaps", [])
-        hierarchy = gap_report.get("category_hierarchy", [])
+        # Compute the "since last run" diff from stored history. The
+        # AnalyzeCoverage operator appends a history entry after every run,
+        # so the *previous* run is the second-to-last entry. When no prior
+        # run exists, diff stays None and the tiered renderer omits the
+        # section entirely.
+        current_entry = build_coverage_history_entry(gap_report, dataset)
+        history = dataset.info.get(HISTORY_INFO_KEY, []) or []
+        previous_entry = history[-2] if len(history) >= 2 else None
+        diff = compute_coverage_diff(current_entry, previous_entry)
 
-        # Build markdown report
-        lines = []
-        lines.append(f"## Coverage Score: {score:.2f}")
-        lines.append("")
+        # Delegate the full three-tier rendering to gap_report so the same
+        # data is reusable outside the operator (notebooks, tests).
+        tiered = build_tiered_report(gap_report, dataset, diff=diff)
+        t1 = tiered["tier1_executive"]
+        t2 = tiered["tier2_priority_gaps"]
+        t3 = tiered["tier3_full_breakdown"]
 
-        # Sparse clusters (sorted by priority_score descending in detect_gaps)
-        if sparse:
-            lines.append(f"### Sparse Clusters ({len(sparse)}) — ranked by priority")
-            for sc in sparse:
-                label = sc["label"]
-                if len(label) > 60:
-                    label = label[:60] + "..."
-                score = sc.get("priority_score", 0.0)
-                lines.append(
-                    f"- **[Priority {score:.0f}/100]** "
-                    f"Cluster {sc['cluster_id']} "
-                    f"({sc['count']} samples): {label}"
-                )
-        else:
-            lines.append("### Sparse Clusters: None")
-        lines.append("")
+        # Priority gap rows, ranked + pre-formatted for TableView display.
+        priority_rows = [
+            {
+                "rank": i + 1,
+                "severity": entry["severity"],
+                "priority_score": f"{entry['priority_score']:.0f}/100",
+                "name": entry["name"],
+                "closest_cluster": entry["closest_cluster"],
+                "similarity": f"{entry['similarity']:.2f}",
+                "collection_recommendation": entry["collection_recommendation"],
+            }
+            for i, entry in enumerate(t2)
+        ]
 
-        # Hierarchical category coverage — parent summary + per-child detail,
-        # with gap children sorted by priority_score so the "fix this next"
-        # item is always at the top of each parent's list.
-        if hierarchy:
-            lines.append(f"### Category Coverage ({len(hierarchy)} parent groups)")
-            for entry in hierarchy:
-                parent = entry["parent"]
-                covered = entry["n_covered"]
-                total = entry["n_children"]
-                coverage_pct = entry["coverage"] * 100
-                best_sim = entry["best_similarity"]
-                lines.append(
-                    f"#### {parent} — {covered}/{total} covered "
-                    f"({coverage_pct:.0f}%, best similarity {best_sim:.2f})"
-                )
-                # Gaps first (highest priority first), then covered items.
-                ordered_children = sorted(
-                    entry["children"],
-                    key=lambda c: (
-                        0 if c["is_gap"] else 1,               # gaps before covered
-                        -float(c.get("priority_score", 0.0)),   # higher priority first
-                        c["category"],
-                    ),
-                )
-                for child in ordered_children:
-                    marker = "✗" if child["is_gap"] else "✓"
-                    nearest = child["closest_cluster"]
-                    if len(nearest) > 50:
-                        nearest = nearest[:50] + "..."
-                    priority_str = (
-                        f" [Priority {child['priority_score']:.0f}/100]"
-                        if child.get("priority_score") is not None and child["is_gap"]
-                        else ""
-                    )
-                    lines.append(
-                        f"- {marker}{priority_str} **{child['category']}** "
-                        f"(similarity: {child['similarity']:.2f}, "
-                        f"nearest: {nearest})"
-                    )
-
-            # Cross-parent "top gaps" rollup so users can see the most
-            # important items across the whole taxonomy at a glance.
-            top_gaps = sorted(
-                (
-                    (child, entry["parent"])
-                    for entry in hierarchy
-                    for child in entry["children"]
-                    if child["is_gap"]
+        # Per-cluster stats table.
+        cluster_rows = [
+            {
+                "cluster_id": c["cluster_id"],
+                "size": c["size"],
+                "status": (
+                    "SPARSE" if c["status"] == "sparse" else "well-covered"
                 ),
-                key=lambda pair: -float(pair[0].get("priority_score", 0.0)),
-            )[:5]
-            if top_gaps:
-                lines.append("")
-                lines.append("#### Top Priority Gaps (across all parents)")
-                for child, parent in top_gaps:
-                    lines.append(
-                        f"1. **[Priority {child['priority_score']:.0f}/100]** "
-                        f"{parent} → {child['category']} "
-                        f"(similarity: {child['similarity']:.2f})"
-                    )
-        elif gaps:
-            # Legacy flat fallback if a cached report predates 3.1
-            lines.append(f"### Category Gaps ({len(gaps)}) — ranked by priority")
-            for cg in gaps:
-                closest = cg["closest_cluster"]
-                if len(closest) > 50:
-                    closest = closest[:50] + "..."
-                priority_str = (
-                    f"[Priority {cg['priority_score']:.0f}/100] "
-                    if cg.get("priority_score") is not None
-                    else ""
-                )
-                lines.append(
-                    f"- {priority_str}**{cg['category']}** "
-                    f"(similarity: {cg['similarity']:.2f}, "
-                    f"nearest: {closest})"
-                )
-        else:
-            lines.append("### Category Coverage: (no expected_categories provided)")
-        lines.append("")
+                "mean_centroid_distance": f"{c['mean_centroid_distance']:.3f}",
+                "max_centroid_distance": f"{c['max_centroid_distance']:.3f}",
+                "cluster_label": c["cluster_label"] or "",
+                "cluster_diversity": c["cluster_diversity"] or "",
+            }
+            for c in t3["clusters"]
+        ]
 
-        # Cluster summary from dataset samples
-        cluster_summary = {}
-        for sample in dataset:
-            try:
-                cid = sample["cluster_id"]
-                label = sample["cluster_label"]
-            except (KeyError, AttributeError):
-                continue
-            if cid is not None:
-                if cid not in cluster_summary:
-                    cluster_summary[cid] = {
-                        "label": label or f"Cluster {cid}",
-                        "count": 0,
-                    }
-                cluster_summary[cid]["count"] += 1
+        # Well-covered categories — flip side of the priority list.
+        well_covered_rows = [
+            {
+                "parent": wc["parent"],
+                "category": wc["category"],
+                "similarity": f"{wc['similarity']:.2f}",
+                "closest_cluster": wc["closest_cluster"],
+            }
+            for wc in t3["well_covered_categories"]
+        ]
 
-        if cluster_summary:
-            lines.append(f"### Cluster Summary ({len(cluster_summary)} clusters)")
-            for cid in sorted(cluster_summary.keys()):
-                info = cluster_summary[cid]
-                label = info["label"]
-                if len(label) > 60:
-                    label = label[:60] + "..."
-                lines.append(
-                    f"- **Cluster {cid}** ({info['count']} samples): {label}"
-                )
-
-        report_md = "\n".join(lines)
+        # Pre-format a short, stand-alone diff string for resolve_output so
+        # the UI-side code only has to pick a severity, not reformat text.
+        diff_label = ""
+        diff_description = ""
+        if diff is not None:
+            delta_sign = "+" if diff["coverage_delta_pct"] >= 0 else ""
+            diff_label = (
+                f"Since last run ({diff['previous_timestamp']}): "
+                f"{diff['coverage_score_prev']*100:.0f}% → "
+                f"{diff['coverage_score_curr']*100:.0f}% "
+                f"({delta_sign}{diff['coverage_delta_pct']:.1f} pts), "
+                f"samples {diff['n_samples_prev']} → {diff['n_samples_curr']}"
+            )
+            parts = []
+            if diff["closed_gaps"]:
+                parts.append(f"Closed: {', '.join(diff['closed_gaps'])}")
+            if diff["still_open_gaps"]:
+                parts.append(f"Still open: {', '.join(diff['still_open_gaps'])}")
+            if diff["newly_opened_gaps"]:
+                parts.append(f"Newly opened: {', '.join(diff['newly_opened_gaps'])}")
+            if not parts:
+                parts.append("No gap changes.")
+            diff_description = " · ".join(parts)
 
         return {
-            "report": report_md,
-            "coverage_score": score,
-            "n_sparse": len(sparse),
-            "n_gaps": len(gaps),
+            "_no_report": False,
+            # Diff ("since last run") — optional, only non-empty when a
+            # previous run's history entry is available.
+            "has_diff": diff is not None,
+            "diff": diff,
+            "diff_label": diff_label,
+            "diff_description": diff_description,
+            "diff_trend": (
+                "up" if diff and diff["coverage_delta"] > 0
+                else "down" if diff and diff["coverage_delta"] < 0
+                else "flat"
+            ),
+            # Tier 1 fields
+            "coverage_pct": t1["coverage_pct"],
+            "coverage_quality": t1["coverage_quality"],
+            "coverage_label": f"Coverage: {t1['coverage_pct']:.1f}% — {t1['coverage_quality']}",
+            "recommendation": t1["recommendation"],
+            "total_videos": t1["total_videos"],
+            "total_clusters": t1["total_clusters"],
+            "n_gaps_total": t1["n_gaps_total"],
+            "n_category_gaps": t1["n_category_gaps"],
+            "n_sparse_clusters": t1["n_sparse_clusters"],
+            # Tier 2 / 3 tables
+            "priority_rows": priority_rows,
+            "cluster_rows": cluster_rows,
+            "well_covered_rows": well_covered_rows,
+            "n_outliers": t3["n_outliers"],
+            # Full markdown (for programmatic consumers, not rendered in panel)
+            "report": render_tiered_report_md(tiered),
+            # Legacy keys expected by existing callers
+            "coverage_score": t1["coverage_score"],
+            "n_sparse": t1["n_sparse_clusters"],
+            "n_gaps": t1["n_gaps_total"],
         }
 
     def resolve_output(self, ctx):
         outputs = types.Object()
-        outputs.str(
-            "report",
-            label="Gap Report",
-            view=types.MarkdownView(),
+        result = ctx.results or {}
+
+        # -------- no-report short-circuit --------
+        if result.get("_no_report") or not result.get("coverage_quality"):
+            outputs.view(
+                "no_report",
+                types.Error(
+                    label="No gap report available",
+                    description=(
+                        "Run the 'Analyze Coverage' operator on this dataset "
+                        "first to generate a report, then re-open 'Show Gap "
+                        "Report'."
+                    ),
+                ),
+            )
+            return types.Property(
+                outputs,
+                view=types.View(label="Gap Detection Report"),
+            )
+
+        # -------- Since last run (only rendered when history exists) --------
+        # Pinned above everything else so the user sees movement before the
+        # current-state headline. Severity tracks the coverage trend:
+        # Success when up, Warning when down, neutral Notice when flat.
+        if result.get("has_diff"):
+            trend = result.get("diff_trend", "flat")
+            diff_label = result.get("diff_label", "")
+            diff_desc = result.get("diff_description", "")
+            if trend == "up":
+                diff_cls = types.Success
+            elif trend == "down":
+                diff_cls = types.Warning
+            else:
+                diff_cls = types.Notice
+            outputs.view(
+                "since_last_run",
+                diff_cls(label=diff_label, description=diff_desc),
+            )
+
+        # -------- Tier 1 — Executive Summary --------
+        outputs.view(
+            "tier1_header",
+            types.Header(
+                label="Tier 1 — Executive Summary",
+                divider=True,
+            ),
         )
-        outputs.float("coverage_score", label="Coverage Score")
-        outputs.int("n_sparse", label="Sparse Clusters")
-        outputs.int("n_gaps", label="Category Gaps")
+
+        quality = result["coverage_quality"]
+        label = result.get("coverage_label", "")
+        desc = result.get("recommendation", "")
+        # Severity-coded notice — surface the coverage band visually so the
+        # user reads red / yellow / green before anything else.
+        if quality == "Poor":
+            notice_cls = types.Error
+        elif quality == "Fair":
+            notice_cls = types.Warning
+        else:  # Good or Excellent
+            notice_cls = types.Success
+        outputs.view(
+            "coverage_notice",
+            notice_cls(label=label, description=desc),
+        )
+
+        # Quick numeric stats rendered as labelled ints so the panel shows
+        # them in a clean vertical stack without markdown formatting quirks.
+        outputs.int("total_videos", label="Videos analyzed")
+        outputs.int("total_clusters", label="Clusters found")
+        outputs.int("n_gaps_total", label="Gaps detected (total)")
+        outputs.int("n_category_gaps", label="  ↳ Category gaps")
+        outputs.int("n_sparse_clusters", label="  ↳ Sparse clusters")
+
+        # -------- Tier 2 — Priority Gaps --------
+        outputs.view(
+            "tier2_header",
+            types.Header(
+                label="Tier 2 — Priority Gaps",
+                divider=True,
+            ),
+        )
+
+        if result.get("priority_rows"):
+            priority_table = types.TableView()
+            priority_table.add_column("rank", label="#")
+            priority_table.add_column("severity", label="Severity")
+            priority_table.add_column("priority_score", label="Priority")
+            priority_table.add_column("name", label="Gap")
+            priority_table.add_column("closest_cluster", label="Closest Cluster")
+            priority_table.add_column("similarity", label="Similarity")
+            priority_table.add_column(
+                "collection_recommendation", label="Recommended action"
+            )
+            outputs.list(
+                "priority_rows",
+                types.Object(),
+                view=priority_table,
+                label="Top gaps ranked by priority (Critical > 70, Moderate 40–70, Low < 40)",
+            )
+        else:
+            outputs.view(
+                "no_priority",
+                types.Success(
+                    label="No gaps detected",
+                    description=(
+                        "Either no expected categories were provided or the "
+                        "dataset already covers every requested category "
+                        "within the similarity threshold."
+                    ),
+                ),
+            )
+
+        # -------- Tier 3 — Full Breakdown --------
+        outputs.view(
+            "tier3_header",
+            types.Header(
+                label="Tier 3 — Full Breakdown",
+                divider=True,
+            ),
+        )
+
+        if result.get("cluster_rows"):
+            cluster_table = types.TableView()
+            cluster_table.add_column("cluster_id", label="Cluster")
+            cluster_table.add_column("size", label="Size")
+            cluster_table.add_column("status", label="Status")
+            cluster_table.add_column("mean_centroid_distance", label="Mean dist")
+            cluster_table.add_column("max_centroid_distance", label="Max dist")
+            cluster_table.add_column("cluster_label", label="Pegasus description")
+            cluster_table.add_column("cluster_diversity", label="Diversity note")
+            outputs.list(
+                "cluster_rows",
+                types.Object(),
+                view=cluster_table,
+                label="Per-cluster statistics",
+            )
+
+        if result.get("n_outliers"):
+            outputs.view(
+                "outliers_notice",
+                types.Notice(
+                    label=f"{result['n_outliers']} outlier videos (HDBSCAN noise)",
+                    description=(
+                        "Videos the clustering couldn't assign to any cluster. "
+                        "Filter by the 'is_outlier' sample field or "
+                        "'sparse_cluster' tag to inspect them."
+                    ),
+                ),
+            )
+
+        if result.get("well_covered_rows"):
+            wc_table = types.TableView()
+            wc_table.add_column("parent", label="Parent")
+            wc_table.add_column("category", label="Category")
+            wc_table.add_column("similarity", label="Similarity")
+            wc_table.add_column("closest_cluster", label="Nearest cluster")
+            outputs.list(
+                "well_covered_rows",
+                types.Object(),
+                view=wc_table,
+                label="Well-covered categories (no action needed)",
+            )
+
         return types.Property(
             outputs,
             view=types.View(label="Gap Detection Report"),
         )
+
+
+# ============================================================
+# Operator 3: ExportCoverageReport
+# ============================================================
+
+class ExportCoverageReport(foo.Operator):
+    """Write a self-contained HTML report to disk.
+
+    The HTML embeds the full three-tier text report, an inline SVG UMAP
+    scatter plot built from per-sample umap_x/umap_y fields, and a base64
+    data-URI download link for a per-cluster CSV. Recipients without
+    FiftyOne installed can open the file in any browser.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="export_coverage_report",
+            label="Export Coverage Report",
+            description=(
+                "Export the gap analysis as a single-file HTML report "
+                "(UMAP plot + three-tier report + downloadable CSV). "
+                "Run 'Analyze Coverage' first to populate the gap report."
+            ),
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str(
+            "output_path",
+            label="Output HTML path",
+            description=(
+                "Absolute or ~-relative path where the self-contained "
+                "HTML file will be written. A '.html' suffix is added if "
+                "missing. Parent directories are created. Existing files "
+                "at the target path are overwritten."
+            ),
+            default="~/coverage_report.html",
+            required=True,
+        )
+        return types.Property(
+            inputs,
+            view=types.View(label="Export Coverage Report"),
+        )
+
+    def execute(self, ctx):
+        dataset = ctx.dataset
+        gap_report = dataset.info.get("gap_report", None)
+        if gap_report is None:
+            return {
+                "error": (
+                    "No gap report found on the dataset. Run the "
+                    "'Analyze Coverage' operator before exporting."
+                ),
+            }
+
+        raw_path = (ctx.params.get("output_path") or "").strip()
+        if not raw_path:
+            return {"error": "Output path is required."}
+
+        # Be forgiving on the extension so the user doesn't get surprised.
+        if not raw_path.lower().endswith((".html", ".htm")):
+            raw_path += ".html"
+
+        try:
+            ctx.set_progress(progress=0.1, label="Rendering three-tier report...")
+            summary = export_coverage_report(dataset, gap_report, raw_path)
+            ctx.set_progress(progress=1.0, label="Export complete")
+        except Exception as e:
+            logger.exception("export_coverage_report failed")
+            return {"error": f"Export failed: {e}"}
+
+        return {
+            "output_path": summary["output_path"],
+            "file_size_bytes": summary["size_bytes"],
+            "n_samples": summary["n_samples"],
+            "n_clusters": summary["n_clusters"],
+        }
+
+    def resolve_output(self, ctx):
+        outputs = types.Object()
+        result = ctx.results or {}
+
+        if "error" in result:
+            outputs.view(
+                "export_error",
+                types.Error(
+                    label="Export failed",
+                    description=result["error"],
+                ),
+            )
+            return types.Property(outputs, view=types.View(label="Export result"))
+
+        path = result.get("output_path", "")
+        size = int(result.get("file_size_bytes", 0))
+        n_samples = int(result.get("n_samples", 0))
+        n_clusters = int(result.get("n_clusters", 0))
+
+        outputs.view(
+            "export_success",
+            types.Success(
+                label="Report exported",
+                description=(
+                    f"Wrote {size:,} bytes to {path}\n"
+                    f"({n_samples} samples plotted, {n_clusters} clusters in CSV). "
+                    "Open the file in any browser to view the report; no "
+                    "FiftyOne install required for recipients."
+                ),
+            ),
+        )
+        outputs.str("output_path", label="Output path")
+        outputs.int("file_size_bytes", label="File size (bytes)")
+        outputs.int("n_samples", label="Samples plotted")
+        outputs.int("n_clusters", label="Clusters in CSV")
+        return types.Property(outputs, view=types.View(label="Export result"))
 
 
 # ============================================================
@@ -2288,4 +2552,5 @@ class CoveragePanel(Panel):
 def register(p):
     p.register(AnalyzeCoverage)
     p.register(ShowGapReport)
+    p.register(ExportCoverageReport)
     p.register(CoveragePanel)
